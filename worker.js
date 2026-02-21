@@ -1,11 +1,11 @@
 /**
  * Cloudflare Workers (Pages) - Telegram Bot Entry Point (V5.5 独立配置版)
- * 核心升级：修复全局设置串线问题，为每个群组引入完全独立的设置面板，Add JSON 直导。
- * V5.5.1 性能优化：批量设置查询、并发成员校验、id-pivot随机、ctx.waitUntil写入异步化
+ * 核心升级：修复全局设置串线问题,为每个群组引入完全独立的设置面板,Add JSON 直导。
+ * V5.6 性能优化：批量设置查询、并发成员校验、id-pivot随机、ctx.waitUntil写入异步化,添加web
  */
 
 /* =========================================================================
- * 模块级常量与缓存（Cloudflare Worker 实例级别，跨请求共享）
+ * 模块级常量与缓存（Cloudflare Worker 实例级别,跨请求共享）
  * ========================================================================= */
 const SETTING_DEFAULTS = Object.freeze({
   display_mode: 'B',
@@ -16,7 +16,7 @@ const SETTING_DEFAULTS = Object.freeze({
   next_mode: 'replace'
 });
 
-// 成员资格 TTL 缓存（60秒），避免重复调用 Telegram getChatMember API
+// 成员资格 TTL 缓存（60秒）,避免重复调用 Telegram getChatMember API
 const GROUP_MEMBER_CACHE_TTL_MS = 60_000;
 const GROUP_MEMBER_CACHE_MAX = 4096;
 const groupMembershipCache = new Map();
@@ -28,6 +28,16 @@ export default {
 
       if (request.method === 'GET' && url.pathname === '/') {
         return await handleSetup(url.origin, env);
+      }
+
+      // 👇 新增：Telegram Web App 的专属前端网页入口
+      if (request.method === 'GET' && url.pathname === '/webapp') {
+        return new Response(getWebAppHTML(), { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
+      }
+      
+      // 👇 新增：Web App 用来拉取底层数据的后端 API 接口 (先占个位)
+      if (request.method === 'POST' && url.pathname === '/api/webapp/data') {
+        return await handleWebAppData(request, env);
       }
 
       if (request.method === 'POST' && url.pathname === '/webhook') {
@@ -65,7 +75,7 @@ async function handleSetup(origin, env) {
       `CREATE TABLE IF NOT EXISTS served_history (media_id INTEGER PRIMARY KEY);`,
       
       // V5.5 核心升级：新建带有 chat_id 的群组独立配置表
-      `CREATE TABLE IF NOT EXISTS chat_settings (chat_id INTEGER, key TEXT, value TEXT, PRIMARY KEY(chat_id, key));`，
+      `CREATE TABLE IF NOT EXISTS chat_settings (chat_id INTEGER, key TEXT, value TEXT, PRIMARY KEY(chat_id, key));`,
       // 兼容旧版留存
       `CREATE TABLE IF NOT EXISTS bot_settings (key TEXT PRIMARY KEY, value TEXT);`,
       // V5.5.1 性能索引
@@ -84,7 +94,7 @@ async function handleSetup(origin, env) {
 
     const webhookUrl = `${origin}/webhook`;
     const tgRes = await tgAPI('setWebhook', { url: webhookUrl }, env);
-    if (!tgRes.ok) throw new 错误('Webhook 注册失败');
+    if (!tgRes.ok) throw new Error('Webhook 注册失败');
 
     const html = `
       <!DOCTYPE html>
@@ -186,7 +196,7 @@ async function handleSetup(origin, env) {
         <div class="glass-card">
           <div class="avatar">🐱</div>
           <h1>🎉 籽青 V5.5.2 满血上线！</h1>
-          <p>性能已优化，多群组数据安全隔离应该正常！<br>Webhook 已经帮主人狠狠地绑死啦：</p>
+          <p>性能已优化,多群组数据安全隔离应该正常！<br>Webhook 已经帮主人狠狠地绑死啦：</p>
           <div class="code-box">${webhookUrl}</div>
           <p style="margin-top: 1.5rem;">快去 Telegram 里找 <span class="highlight">籽青</span> 玩耍吧！QwQ</p>
           <div class="footer">Powered by Cloudflare Workers & D1</div>
@@ -301,7 +311,7 @@ async function handleSetup(origin, env) {
         <div class="blob-2"></div>
         <div class="glass-card">
           <div class="avatar">😿</div>
-          <h1>呜呜，籽青摔倒了喵...</h1>
+          <h1>呜呜,籽青摔倒了喵...</h1>
           <p>部署过程中出现了一点小意外！<br>请主人检查一下 <span class="highlight">D1 数据库绑定</span> 或者 <span class="highlight">BOT_TOKEN</span> 哦：</p>
           <div class="code-box">${error.message}</div>
           <p style="margin-top: 1.5rem;">修好之后再刷新一下这个页面就可以啦！QwQ</p>
@@ -340,7 +350,7 @@ async function handleMessage(message, env, ctx) {
   }
 
   if (text.startsWith('/import_json')) {
-    const importHelp = `📥 **关于导入历史数据喵**\n\n籽青有两种方法可以吃掉历史数据哦：\n\n1. **直接投喂 (适合 5MB 以内的小包裹)**：直接把 \`.json\` 文件发给籽青，并在文件的说明(Caption)里写上 \`/import 分类名\` 即可！\n2. **脚本投喂 (适合大包裹)**：在电脑上运行配套的 Python 导入脚本，慢慢喂给籽青！QwQ`;
+    const importHelp = `📥 **关于导入历史数据喵**\n\n籽青有两种方法可以吃掉历史数据哦：\n\n1. **直接投喂 (适合 5MB 以内的小包裹)**：直接把 \`.json\` 文件发给籽青,并在文件的说明(Caption)里写上 \`/import 分类名\` 即可！\n2. **脚本投喂 (适合大包裹)**：在电脑上运行配套的 Python 导入脚本,慢慢喂给籽青！QwQ`;
     await tgAPI('sendMessage', { chat_id: chatId, message_thread_id: topicId, text: importHelp, parse_mode: 'Markdown' }, env);
     return;
   }
@@ -366,17 +376,17 @@ async function handleMessage(message, env, ctx) {
   // ==== 内置 JSON 直接解析功能 ====
   if (message.document && message.document.file_name && message.document.file_name.endsWith('.json') && text.startsWith('/import ')) {
     if (!(await isAdmin(chatId, userId, env))) {
-      return tgAPI('sendMessage', { chat_id: chatId, message_thread_id: topicId, text: `🚨 呜呜，只有管理员主人才可以给籽青投喂文件哦！` }, env);
+      return tgAPI('sendMessage', { chat_id: chatId, message_thread_id: topicId, text: `🚨 呜呜,只有管理员主人才可以给籽青投喂文件哦！` }, env);
     }
     
     const category = text.replace('/import ', '').trim();
-    if (!category) return tgAPI('sendMessage', { chat_id: chatId, message_thread_id: topicId, text: `喵？请在文件说明里写上正确格式，比如：\`/import 分类名\` 哦！` }, env);
+    if (!category) return tgAPI('sendMessage', { chat_id: chatId, message_thread_id: topicId, text: `喵？请在文件说明里写上正确格式,比如：\`/import 分类名\` 哦！` }, env);
 
     if (message.document.file_size > 5242880) {
-      return tgAPI('sendMessage', { chat_id: chatId, message_thread_id: topicId, text: `🚨 呜呜... 这个包裹太大了（超过 5MB），籽青的肚子装不下会撑爆的！请使用 Python 脚本进行外部导入喵 QwQ` }, env);
+      return tgAPI('sendMessage', { chat_id: chatId, message_thread_id: topicId, text: `🚨 呜呜... 这个包裹太大了（超过 5MB）,籽青的肚子装不下会撑爆的！请使用 Python 脚本进行外部导入喵 QwQ` }, env);
     }
 
-    await tgAPI('sendMessage', { chat_id: chatId, message_thread_id: topicId, text: `📥 收到包裹！籽青正在努力吃掉这个文件，请稍等喵...` }, env);
+    await tgAPI('sendMessage', { chat_id: chatId, message_thread_id: topicId, text: `📥 收到包裹！籽青正在努力吃掉这个文件,请稍等喵...` }, env);
 
     try {
       const fileRes = await tgAPI('getFile', { file_id: message.document.file_id }, env);
@@ -419,7 +429,7 @@ async function handleMessage(message, env, ctx) {
       }
 
       if (validMedia.length === 0) {
-        return tgAPI('sendMessage', { chat_id: chatId, message_thread_id: topicId, text: `❓ 哎呀，籽青在这个文件里没有找到任何图片或视频记录喵。` }, env);
+        return tgAPI('sendMessage', { chat_id: chatId, message_thread_id: topicId, text: `❓ 哎呀,籽青在这个文件里没有找到任何图片或视频记录喵。` }, env);
       }
 
       let successCount = 0;
@@ -435,7 +445,7 @@ async function handleMessage(message, env, ctx) {
 
       await tgAPI('sendMessage', { chat_id: chatId, message_thread_id: topicId, text: `🎉 嗝~ 吃饱啦！成功从文件里导入了 ${successCount} 条【${category}】的记录喵！` }, env);
     } catch (err) {
-      await tgAPI('sendMessage', { chat_id: chatId, message_thread_id: topicId, text: `❌ 呜呜，籽青吃坏肚子了，导入失败喵：${err.message}` }, env);
+      await tgAPI('sendMessage', { chat_id: chatId, message_thread_id: topicId, text: `❌ 呜呜,籽青吃坏肚子了,导入失败喵：${err.message}` }, env);
     }
     return; 
   }
@@ -448,7 +458,7 @@ async function handleMessage(message, env, ctx) {
       const existing = await env.D1.prepare(`SELECT id FROM media_library WHERE file_unique_id = ? AND chat_id = ? LIMIT 1`).bind(mediaInfo.fileUniqueId, chatId).first();
       if (existing) {
         const notify = await getSetting(chatId, 'dup_notify', env);
-        if (notify === 'true') await tgAPI('sendMessage', { chat_id: chatId, message_thread_id: topicId, reply_to_message_id: message.message_id, text: "哎呀，籽青发现这个内容之前已经收录过啦喵~" }, env);
+        if (notify === 'true') await tgAPI('sendMessage', { chat_id: chatId, message_thread_id: topicId, reply_to_message_id: message.message_id, text: "哎呀,籽青发现这个内容之前已经收录过啦喵~" }, env);
         return; 
       }
       await env.D1.prepare(`INSERT INTO media_library (message_id, chat_id, topic_id, category_name, file_unique_id, file_id, media_type, caption) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
@@ -503,7 +513,7 @@ async function handleCallback(callback, env, ctx) {
     const sourceChatId = params.length > 1 ? parseInt(params[1]) : chatId;
 
     await tgAPI('answerCallbackQuery', { callback_query_id: cbId, text: "籽青正在为你抽取喵..." }, env);
-    await sendRandomMedia(userId, chatId, msgId, topicId, category, sourceChatId, action === 'next_', env, ctx);
+    await sendRandomMedia(userId, chatId, msgId, topicId, category, sourceChatId, action === 'next_', env, ctx, cbId);
   }
 
   else if (data.startsWith('fav_add_')) {
@@ -530,7 +540,7 @@ async function handleCallback(callback, env, ctx) {
   else if (data.startsWith('set_')) {
     if (chatId > 0) return tgAPI('answerCallbackQuery', { callback_query_id: cbId, text: "喵！只能在群组内使用设置面板哦！", show_alert: true }, env);
     if (!(await isAdmin(chatId, userId, env))) {
-      await tgAPI('answerCallbackQuery', { callback_query_id: cbId, text: "呜呜，只有管理员才能调整籽青哦！", show_alert: true }, env);
+      await tgAPI('answerCallbackQuery', { callback_query_id: cbId, text: "呜呜,只有管理员才能调整籽青哦！", show_alert: true }, env);
       return;
     }
 
@@ -552,7 +562,7 @@ async function handleCallback(callback, env, ctx) {
     }
 
     else if (data === 'set_danger_zone') {
-      const text = "⚠️ **危险操作区**\n\n这里的操作仅对当前群组生效，且不可逆喵！";
+      const text = "⚠️ **危险操作区**\n\n这里的操作仅对当前群组生效,且不可逆喵！";
       const keyboard = [[{ text: "🧨 清空本群数据统计", callback_data: "set_clear_stats_1" }], [{ text: "🚨 彻底清空本群媒体库", callback_data: "set_clear_media_1" }], [{ text: "⬅️ 返回安全区", callback_data: "set_main" }]];
       await tgAPI('editMessageText', { chat_id: chatId, message_id: msgId, text, parse_mode: 'Markdown', reply_markup: { inline_keyboard: keyboard } }, env);
     }
@@ -587,7 +597,7 @@ async function sendMainMenu(chatId, topicId, env, userId) {
   if (chatId > 0) {
     const allowedGroups = await getUserAllowedGroups(userId, env);
     if (allowedGroups.length === 0) {
-      await tgAPI('sendMessage', { chat_id: chatId, text: "⛔ 喵呜... 籽青查了一下，你目前还没有加入任何授权群组呢，不能给你看图库哦 QwQ", parse_mode: 'HTML' }, env);
+      await tgAPI('sendMessage', { chat_id: chatId, text: "⛔ 喵呜... 籽青查了一下,你目前还没有加入任何授权群组呢,不能给你看图库哦 QwQ", parse_mode: 'HTML' }, env);
       return;
     }
   }
@@ -598,11 +608,11 @@ async function editMainMenu(chatId, msgId, env, userId) {
   if (chatId > 0) {
     const allowedGroups = await getUserAllowedGroups(userId, env);
     if (allowedGroups.length === 0) {
-      await tgAPI('editMessageText', { chat_id: chatId, message_id: msgId, text: "⛔ 喵... 你好像退群了呢，籽青已经把菜单收回去了哦！" }, env);
+      await tgAPI('editMessageText', { chat_id: chatId, message_id: msgId, text: "⛔ 喵... 你好像退群了呢,籽青已经把菜单收回去了哦！" }, env);
       return;
     }
   }
-  await tgAPI('editMessageText', { chat_id: chatId, message_id: msgId, text: "这是籽青的主菜单，请选择喵：", reply_markup: getMainMenuMarkup() }, env);
+  await tgAPI('editMessageText', { chat_id: chatId, message_id: msgId, text: "这是籽青的主菜单,请选择喵：", reply_markup: getMainMenuMarkup() }, env);
 }
 
 function getMainMenuMarkup() {
@@ -630,7 +640,7 @@ async function showCategories(chatId, msgId, env, userId) {
     }
   }
 
-  if (keyboard.length === 0) return tgAPI('editMessageText', { chat_id: chatId, message_id: msgId, text: "呜呜，当前群组还没有绑定任何分类喵，管理员请使用 /bind 绑定哦！", reply_markup: getBackMarkup() }, env);
+  if (keyboard.length === 0) return tgAPI('editMessageText', { chat_id: chatId, message_id: msgId, text: "呜呜,当前群组还没有绑定任何分类喵,管理员请使用 /bind 绑定哦！", reply_markup: getBackMarkup() }, env);
 
   keyboard.push([{ text: "🏠 返回主菜单", callback_data: "main_menu" }]);
   const text = chatId < 0 ? "请选择您感兴趣的分类喵：" : "👇 以下是您所在群组的专属图库喵：";
@@ -638,11 +648,11 @@ async function showCategories(chatId, msgId, env, userId) {
 }
 
 // ==== 核心抽取与展现逻辑 (融合 方案A: 失效自动清理 & 群组炸群连坐清理) ====
-async function sendRandomMedia(userId, chatId, msgId, topicId, category, sourceChatId, isNext, env, ctx) {
+async function sendRandomMedia(userId, chatId, msgId, topicId, category, sourceChatId, isNext, env, ctx, cbId) {
   if (chatId > 0) {
     const inGroup = await isUserInGroup(sourceChatId, userId, env);
     if (!inGroup) {
-      await tgAPI('editMessageText', { chat_id: chatId, message_id: msgId, text: "🚨 喵！大骗子！籽青发现你已经退群啦，休想再拿之前的菜单偷看！(｀・ω・´)" }, env);
+      await tgAPI('editMessageText', { chat_id: chatId, message_id: msgId, text: "🚨 喵！大骗子！籽青发现你已经退群啦,休想再拿之前的菜单偷看！(｀・ω・´)" }, env);
       return;
     }
   }
@@ -652,12 +662,12 @@ async function sendRandomMedia(userId, chatId, msgId, topicId, category, sourceC
 
   if (chatId < 0) {
     const output = await env.D1.prepare(`SELECT chat_id, topic_id FROM config_topics WHERE category_name = 'output' AND chat_id = ? LIMIT 1`).bind(chatId).first();
-    if (!output) return tgAPI('sendMessage', { chat_id: chatId, message_thread_id: topicId, text: `喵？管理员还没设置本群输出话题呢，请用 /bind_output 设置！` }, env);
+    if (!output) return tgAPI('sendMessage', { chat_id: chatId, message_thread_id: topicId, text: `喵？管理员还没设置本群输出话题呢,请用 /bind_output 设置！` }, env);
     outChatId = output.chat_id;
     outTopicId = output.topic_id;
   }
 
-  // P1: 批量读取所有设置，1次 D1 查询替代 5次
+  // P1: 批量读取所有设置,1次 D1 查询替代 5次
   const settings = await getSettingsBatch(sourceChatId, ['display_mode', 'anti_repeat', 'auto_jump', 'show_success', 'next_mode'], env);
   const mode = settings.display_mode;
   const useAntiRepeat = settings.anti_repeat === 'true';
@@ -678,7 +688,7 @@ async function sendRandomMedia(userId, chatId, msgId, topicId, category, sourceC
     }
   }
 
-  // 🌟 方案 A 自动重试与体检循环 (最多重试 3 次，防止 CF Worker 超时)
+  // 🌟 方案 A 自动重试与体检循环 (最多重试 3 次,防止 CF Worker 超时)
   let attempts = 0;
   let foundValid = false;
   let media = null;
@@ -690,18 +700,18 @@ async function sendRandomMedia(userId, chatId, msgId, topicId, category, sourceC
     // 1. P1: id-pivot 随机策略替代 ORDER BY RANDOM() 全表扫描
     media = await selectRandomMedia(category, sourceChatId, useAntiRepeat, env);
 
-    // 如果防重库空了，重置防重库再捞一次
+    // 如果防重库空了,重置防重库再捞一次
     if (!media && useAntiRepeat) {
       const totalCheck = await env.D1.prepare(`SELECT count(*) as c FROM media_library WHERE category_name = ? AND chat_id = ?`).bind(category, sourceChatId).first();
       if (totalCheck && totalCheck.c > 0) {
         await env.D1.prepare(`DELETE FROM served_history WHERE media_id IN (SELECT id FROM media_library WHERE category_name = ? AND chat_id = ?)`).bind(category, sourceChatId).run();
-        await tgAPI('sendMessage', { chat_id: outChatId, message_thread_id: outTopicId, text: `🎉 哇哦，【${category}】的内容全看光了！籽青已重置防重库喵~` }, env);
+        await tgAPI('sendMessage', { chat_id: outChatId, message_thread_id: outTopicId, text: `🎉 哇哦,【${category}】的内容全看光了！籽青已重置防重库喵~` }, env);
         media = await selectRandomMedia(category, sourceChatId, false, env);
       }
     }
 
     if (!media) {
-      await tgAPI('sendMessage', { chat_id: chatId, message_thread_id: topicId, text: `呜呜，该分类里还没有内容呢喵~` }, env);
+      await tgAPI('sendMessage', { chat_id: chatId, message_thread_id: topicId, text: `呜呜,该分类里还没有内容呢喵~` }, env);
       return;
     }
 
@@ -749,10 +759,10 @@ async function sendRandomMedia(userId, chatId, msgId, topicId, category, sourceC
 
   // ==== 循环结束后的收尾工作 ====
   if (!foundValid) {
-    return tgAPI('sendMessage', { chat_id: chatId, message_thread_id: topicId, text: "🧹 呼... 连续抽到好多失效图片，籽青已经把坏数据打扫干净啦，请主人再点一次重抽喵！" }, env);
+    return tgAPI('sendMessage', { chat_id: chatId, message_thread_id: topicId, text: "🧹 呼... 连续抽到好多失效图片,籽青已经把坏数据打扫干净啦,请主人再点一次重抽喵！" }, env);
   }
 
-  // P3: 统计写入全部异步化，不阻塞响应
+  // P3: 统计写入全部异步化,不阻塞响应
   ctx.waitUntil(Promise.all([
     useAntiRepeat ? env.D1.prepare(`INSERT OR IGNORE INTO served_history (media_id) VALUES (?)`).bind(media.id).run() : Promise.resolve(),
     env.D1.prepare(`INSERT INTO last_served (user_id, last_media_id, served_at) VALUES (?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET last_media_id=excluded.last_media_id, served_at=excluded.served_at`).bind(userId, media.id, now).run(),
@@ -776,7 +786,7 @@ async function sendRandomMedia(userId, chatId, msgId, topicId, category, sourceC
 async function showLeaderboard(chatId, msgId, page, env) {
   const limit = 5;
   const offset = page * limit;
-  if (chatId > 0) return tgAPI('editMessageText', { chat_id: chatId, message_id: msgId, text: "喵，私聊模式暂不支持查看群排行哦，请在群组内使用 QwQ", reply_markup: getBackMarkup() }, env);
+  if (chatId > 0) return tgAPI('editMessageText', { chat_id: chatId, message_id: msgId, text: "喵,私聊模式暂不支持查看群排行哦,请在群组内使用 QwQ", reply_markup: getBackMarkup() }, env);
 
   const [leaderData, totalRes] = await Promise.all([
     env.D1.prepare(`SELECT chat_id, message_id, category_name, view_count, caption FROM media_library WHERE view_count > 0 AND chat_id = ? ORDER BY view_count DESC LIMIT ? OFFSET ?`).bind(chatId, limit, offset).all(),
@@ -846,7 +856,7 @@ async function viewFavorite(chatId, topicId, mediaId, env) {
 
 // ==== V5.5 专属设置看板 (基于 chat_id 获取独立配置) ====
 async function showSettingsMain(chatId, msgId, env) {
-  // P1: 批量读取所有设置，1次 D1 查询替代 6次
+  // P1: 批量读取所有设置,1次 D1 查询替代 6次
   const settings = await getSettingsBatch(chatId, ['display_mode', 'anti_repeat', 'auto_jump', 'dup_notify', 'show_success', 'next_mode'], env);
   const mode = settings.display_mode;
   const repeat = settings.anti_repeat;
@@ -876,7 +886,7 @@ async function toggleSetting(key, env, chatId, msgId, values) {
   const valCurrent = current === null ? values[0] : current;
   const next = valCurrent === values[0] ? values[1] : values[0];
   
-  // 插入带有 chat_id 的设置，遇到冲突就更新 value
+  // 插入带有 chat_id 的设置,遇到冲突就更新 value
   await env.D1.prepare(`INSERT INTO chat_settings (chat_id, key, value) VALUES (?, ?, ?) ON CONFLICT(chat_id, key) DO UPDATE SET value=excluded.value`).bind(chatId, key, next).run();
   
   await showSettingsMain(chatId, msgId, env);
@@ -906,13 +916,137 @@ function getBackMarkup() {
 }
 
 /* =========================================================================
+ * Telegram Web App (小程序) 前端 UI 与 后端 API 模块
+ * ========================================================================= */
+function getWebAppHTML() {
+  return `
+    <!DOCTYPE html>
+    <html lang="zh-CN">
+    <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+      <title>籽青控制台</title>
+      <script src="https://telegram.org/js/telegram-web-app.js"></script>
+      <style>
+        :root {
+          --tg-theme-bg-color: #f3f4f6;
+          --tg-theme-text-color: #222222;
+          --tg-theme-button-color: #ff758c;
+          --tg-theme-button-text-color: #ffffff;
+          --tg-theme-secondary-bg-color: #e5e7eb;
+        }
+        body {
+          font-family: system-ui, -apple-system, sans-serif;
+          background-color: var(--tg-theme-bg-color);
+          color: var(--tg-theme-text-color);
+          margin: 0; padding: 0; padding-bottom: 70px;
+          transition: background-color 0.3s, color 0.3s;
+        }
+        .header { padding: 20px; background: linear-gradient(135deg, #ff758c 0%, #ff7eb3 100%); color: white; border-bottom-left-radius: 20px; border-bottom-right-radius: 20px; box-shadow: 0 4px 15px rgba(255, 117, 140, 0.3); }
+        .header h1 { margin: 0; font-size: 24px; font-weight: bold; }
+        .header p { margin: 5px 0 0; opacity: 0.9; font-size: 14px; }
+        
+        .tab-content { display: none; padding: 20px; animation: fadeIn 0.3s ease; }
+        .tab-content.active { display: block; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+        
+        .card { background-color: var(--tg-theme-secondary-bg-color); border-radius: 16px; padding: 16px; margin-bottom: 16px; box-shadow: 0 2px 10px rgba(0,0,0,0.05); }
+        .card h3 { margin-top: 0; margin-bottom: 10px; font-size: 16px; display: flex; align-items: center; gap: 8px;}
+        
+        .bottom-nav { position: fixed; bottom: 0; left: 0; right: 0; height: 65px; background-color: var(--tg-theme-secondary-bg-color); display: flex; justify-content: space-around; align-items: center; border-top-left-radius: 20px; border-top-right-radius: 20px; box-shadow: 0 -2px 15px rgba(0,0,0,0.05); z-index: 1000;}
+        .nav-item { display: flex; flex-direction: column; align-items: center; justify-content: center; width: 33%; height: 100%; color: var(--tg-theme-text-color); opacity: 0.6; text-decoration: none; font-size: 12px; font-weight: bold; transition: all 0.2s; }
+        .nav-item.active { opacity: 1; color: var(--tg-theme-button-color); transform: translateY(-2px); }
+        .nav-icon { font-size: 24px; margin-bottom: 4px; }
+      </style>
+    </head>
+    <body>
+      <div class="header">
+        <h1>🐾 籽青控制台</h1>
+        <p id="welcome-text">正在连接神经元...</p>
+      </div>
+
+      <div id="tab-dashboard" class="tab-content active">
+        <div class="card">
+          <h3>📊 全局数据总览</h3>
+          <p>这里以后会画漂亮的柱状图和饼图喵！</p>
+          <div style="display:flex; justify-content: space-between; margin-top: 15px;">
+            <div style="text-align:center;"><b>???</b><br><small>总收录</small></div>
+            <div style="text-align:center;"><b>???</b><br><small>总浏览</small></div>
+            <div style="text-align:center;"><b>???</b><br><small>群组数</small></div>
+          </div>
+        </div>
+      </div>
+
+      <div id="tab-settings" class="tab-content">
+        <div class="card">
+          <h3>⚙️ 高级配置</h3>
+          <p>可视化的开关正在紧锣密鼓地施工中喵！以后点这里的按钮就能直接改数据库啦！</p>
+          <button style="width: 100%; padding: 12px; border: none; border-radius: 10px; background: var(--tg-theme-button-color); color: var(--tg-theme-button-text-color); font-weight: bold;">测试按钮 (暂无功能)</button>
+        </div>
+      </div>
+
+      <div id="tab-gallery" class="tab-content">
+        <div class="card">
+          <h3>🖼️ 我的私人画廊</h3>
+          <p>瀑布流照片墙施工中... 敬请期待！(๑•̀ㅂ•́)و✧</p>
+        </div>
+      </div>
+
+      <div class="bottom-nav">
+        <div class="nav-item active" onclick="switchTab('dashboard', this)">
+          <div class="nav-icon">📊</div><span>看板</span>
+        </div>
+        <div class="nav-item" onclick="switchTab('settings', this)">
+          <div class="nav-icon">⚙️</div><span>设置</span>
+        </div>
+        <div class="nav-item" onclick="switchTab('gallery', this)">
+          <div class="nav-icon">🖼️</div><span>画廊</span>
+        </div>
+      </div>
+
+      <script>
+        const tg = window.Telegram.WebApp;
+        tg.expand(); 
+        tg.ready();  
+
+        document.documentElement.style.setProperty('--tg-theme-bg-color', tg.themeParams.bg_color || '#f3f4f6');
+        document.documentElement.style.setProperty('--tg-theme-text-color', tg.themeParams.text_color || '#222222');
+        document.documentElement.style.setProperty('--tg-theme-button-color', tg.themeParams.button_color || '#ff758c');
+        document.documentElement.style.setProperty('--tg-theme-button-text-color', tg.themeParams.button_text_color || '#ffffff');
+        document.documentElement.style.setProperty('--tg-theme-secondary-bg-color', tg.themeParams.secondary_bg_color || '#e5e7eb');
+
+        const user = tg.initDataUnsafe?.user;
+        if (user) {
+          document.getElementById('welcome-text').innerText = '欢迎回来,' + (user.first_name || '主人') + ' 喵！';
+        } else {
+          document.getElementById('welcome-text').innerText = '欢迎访问网页端喵！';
+        }
+
+        function switchTab(tabId, el) {
+          document.querySelectorAll('.tab-content').forEach(tab => tab.classList.remove('active'));
+          document.querySelectorAll('.nav-item').forEach(nav => nav.classList.remove('active'));
+          document.getElementById('tab-' + tabId).classList.add('active');
+          el.classList.add('active');
+          tg.HapticFeedback.impactOccurred('light');
+        }
+      </script>
+    </body>
+    </html>
+  `;
+}
+
+async function handleWebAppData(request, env) {
+  return new Response(JSON.stringify({ status: "working on it!" }), { headers: { 'Content-Type': 'application/json' } });
+}
+
+/* =========================================================================
  * 工具、API 与 身份鉴权拦截
  * ========================================================================= */
 async function getUserAllowedGroups(userId, env) {
   const { results } = await env.D1.prepare(`SELECT DISTINCT chat_id FROM config_topics WHERE chat_id < 0`).all();
   if (!results || results.length === 0) return [];
 
-  // P0: 并发检查所有群组，替代串行 for loop
+  // P0: 并发检查所有群组,替代串行 for loop
   const checks = results.map(row =>
     isUserInGroup(row.chat_id, userId, env).then(inGroup => inGroup ? row.chat_id : null)
   );
@@ -920,7 +1054,7 @@ async function getUserAllowedGroups(userId, env) {
 }
 
 async function isUserInGroup(groupId, userId, env) {
-  // P0: TTL 缓存，避免对同一用户/群组重复调用 Telegram API
+  // P0: TTL 缓存,避免对同一用户/群组重复调用 Telegram API
   const cacheKey = `${groupId}:${userId}`;
   const now = Date.now();
   const cached = groupMembershipCache.get(cacheKey);
@@ -930,7 +1064,7 @@ async function isUserInGroup(groupId, userId, env) {
   const data = await res.json();
   const inGroup = data.ok && ['creator', 'administrator', 'member', 'restricted'].includes(data.result.status);
 
-  // 写入缓存，LRU 超限时淘汰最旧条目
+  // 写入缓存,LRU 超限时淘汰最旧条目
   if (groupMembershipCache.size >= GROUP_MEMBER_CACHE_MAX) {
     groupMembershipCache.delete(groupMembershipCache.keys().next().value);
   }
@@ -961,7 +1095,7 @@ async function getSetting(chatId, key, env) {
   return SETTING_DEFAULTS[key] ?? null;
 }
 
-// P1: 批量读取多个设置，单次 D1 查询
+// P1: 批量读取多个设置,单次 D1 查询
 async function getSettingsBatch(chatId, keys, env) {
   const uniqueKeys = [...new Set(keys)];
   const placeholders = uniqueKeys.map(() => '?').join(', ');
@@ -974,8 +1108,8 @@ async function getSettingsBatch(chatId, keys, env) {
   return out;
 }
 
-// P1: id-pivot 随机策略，替代 ORDER BY RANDOM() 全表扫描
-// 原理：随机选取一个 id pivot，优先找 id >= pivot 的第一条，找不到则回绕找 id < pivot 的第一条
+// P1: id-pivot 随机策略,替代 ORDER BY RANDOM() 全表扫描
+// 原理：随机选取一个 id pivot,优先找 id >= pivot 的第一条,找不到则回绕找 id < pivot 的第一条
 async function selectRandomMedia(category, sourceChatId, useAntiRepeat, env) {
   const maxRow = await env.D1.prepare(
     `SELECT MAX(id) AS max_id FROM media_library WHERE category_name = ? AND chat_id = ?`
@@ -1008,5 +1142,5 @@ async function isAdmin(chatId, userId, env) {
 }
 
 function makeDeepLink(chatId, messageId) {
-  return `https://t.me/c/${String(chatId).replace('-100', '')}/${messageId}`;
+  return `https://t.me/c/${String(chatId).替换('-100', '')}/${messageId}`;
 }

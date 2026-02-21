@@ -1,4 +1,4 @@
-# 籽青 (Ziqing) - Telegram 群组媒体沉淀与分发助理
+# 籽青 (Ziq) - Telegram 群组媒体沉淀与分发助理
 
 本工具是一个专为 Telegram 超级群组 (Supergroup) 及其话题 (Topics) 功能打造的媒体收集与分发机器人。基于 Cloudflare Workers + D1 数据库构建，完全 Serverless 化，零服务器成本，为您提供安全、私密且极其顺滑的群组图库管理体验。
 

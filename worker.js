@@ -1,7 +1,25 @@
 /**
  * Cloudflare Workers (Pages) - Telegram Bot Entry Point (V5.5 独立配置版)
  * 核心升级：修复全局设置串线问题，为每个群组引入完全独立的设置面板，Add JSON 直导。
+ * V5.5.1 性能优化：批量设置查询、并发成员校验、id-pivot随机、ctx.waitUntil写入异步化
  */
+
+/* =========================================================================
+ * 模块级常量与缓存（Cloudflare Worker 实例级别，跨请求共享）
+ * ========================================================================= */
+const SETTING_DEFAULTS = Object.freeze({
+  display_mode: 'B',
+  anti_repeat: 'true',
+  auto_jump: 'true',
+  dup_notify: 'false',
+  show_success: 'true',
+  next_mode: 'replace'
+});
+
+// 成员资格 TTL 缓存（60秒），避免重复调用 Telegram getChatMember API
+const GROUP_MEMBER_CACHE_TTL_MS = 60_000;
+const GROUP_MEMBER_CACHE_MAX = 4096;
+const groupMembershipCache = new Map();
 
 export default {
   async fetch(request, env, ctx) {
@@ -14,7 +32,7 @@ export default {
 
       if (request.method === 'POST' && url.pathname === '/webhook') {
         const update = await request.json();
-        ctx.waitUntil(handleUpdate(update, env));
+        ctx.waitUntil(handleUpdate(update, env, ctx));
         return new Response('OK', { status: 200 });
       }
 
@@ -49,7 +67,12 @@ async function handleSetup(origin, env) {
       // V5.5 核心升级：新建带有 chat_id 的群组独立配置表
       `CREATE TABLE IF NOT EXISTS chat_settings (chat_id INTEGER, key TEXT, value TEXT, PRIMARY KEY(chat_id, key));`,
       // 兼容旧版留存
-      `CREATE TABLE IF NOT EXISTS bot_settings (key TEXT PRIMARY KEY, value TEXT);`
+      `CREATE TABLE IF NOT EXISTS bot_settings (key TEXT PRIMARY KEY, value TEXT);`,
+      // V5.5.1 性能索引
+      `CREATE INDEX IF NOT EXISTS idx_media_chat_cat_id ON media_library (chat_id, category_name, id);`,
+      `CREATE INDEX IF NOT EXISTS idx_media_chat_viewcount ON media_library (chat_id, view_count DESC);`,
+      `CREATE INDEX IF NOT EXISTS idx_topics_chat_cat ON config_topics (chat_id, category_name);`,
+      `CREATE INDEX IF NOT EXISTS idx_served_history_media ON served_history (media_id);`
     ];
 
     for (const sql of initSQL) await env.D1.prepare(sql).run();
@@ -97,15 +120,15 @@ async function handleSetup(origin, env) {
 /* =========================================================================
  * 路由与消息处理
  * ========================================================================= */
-async function handleUpdate(update, env) {
+async function handleUpdate(update, env, ctx) {
   if (update.message) {
-    await handleMessage(update.message, env);
+    await handleMessage(update.message, env, ctx);
   } else if (update.callback_query) {
-    await handleCallback(update.callback_query, env);
+    await handleCallback(update.callback_query, env, ctx);
   }
 }
 
-async function handleMessage(message, env) {
+async function handleMessage(message, env, ctx) {
   const text = message.text || message.caption || '';
   const chatId = message.chat.id;
   const topicId = message.message_thread_id || null;
@@ -255,60 +278,66 @@ function extractMediaInfo(message) {
 /* =========================================================================
  * 回调交互处理
  * ========================================================================= */
-async function handleCallback(callback, env) {
+async function handleCallback(callback, env, ctx) {
   const data = callback.data;
   const userId = callback.from.id;
-  const chatId = callback.message.chat.id; 
+  const chatId = callback.message.chat.id;
   const msgId = callback.message.message_id;
   const topicId = callback.message.message_thread_id || null;
   const cbId = callback.id;
 
   if (data === 'main_menu') {
-    await editMainMenu(chatId, msgId, env, userId);
-    await tgAPI('answerCallbackQuery', { callback_query_id: cbId }, env);
+    await Promise.all([
+      editMainMenu(chatId, msgId, env, userId),
+      tgAPI('answerCallbackQuery', { callback_query_id: cbId }, env)
+    ]);
   } else if (data === 'main_menu_new') {
-    await sendMainMenu(chatId, topicId, env, userId);
-    await tgAPI('answerCallbackQuery', { callback_query_id: cbId }, env);
+    await Promise.all([
+      sendMainMenu(chatId, topicId, env, userId),
+      tgAPI('answerCallbackQuery', { callback_query_id: cbId }, env)
+    ]);
   } else if (data === 'start_random') {
-    await showCategories(chatId, msgId, env, userId);
     await tgAPI('answerCallbackQuery', { callback_query_id: cbId }, env);
+    await showCategories(chatId, msgId, env, userId);
   } else if (data.startsWith('random_') || data.startsWith('next_')) {
     const action = data.startsWith('random_') ? 'random_' : 'next_';
     const params = data.replace(action, '').split('|');
     const category = params[0];
     const sourceChatId = params.length > 1 ? parseInt(params[1]) : chatId;
-    
+
     await tgAPI('answerCallbackQuery', { callback_query_id: cbId, text: "籽青正在为你抽取喵..." }, env);
-    await sendRandomMedia(userId, chatId, msgId, topicId, category, sourceChatId, action === 'next_', env);
-  } 
-  
+    await sendRandomMedia(userId, chatId, msgId, topicId, category, sourceChatId, action === 'next_', env, ctx);
+  }
+
   else if (data.startsWith('fav_add_')) {
     await handleAddFavorite(userId, cbId, parseInt(data.replace('fav_add_', '')), env);
   } else if (data === 'favorites' || data.startsWith('fav_page_')) {
+    await tgAPI('answerCallbackQuery', { callback_query_id: cbId }, env);
     const page = data === 'favorites' ? 0 : parseInt(data.replace('fav_page_', ''));
     await showFavoritesList(chatId, msgId, userId, page, env);
-    await tgAPI('answerCallbackQuery', { callback_query_id: cbId }, env);
   } else if (data.startsWith('fav_view_')) {
-    await viewFavorite(chatId, topicId, parseInt(data.replace('fav_view_', '')), env);
     await tgAPI('answerCallbackQuery', { callback_query_id: cbId }, env);
+    await viewFavorite(chatId, topicId, parseInt(data.replace('fav_view_', '')), env);
   } else if (data.startsWith('fav_del_')) {
     await env.D1.prepare(`DELETE FROM user_favorites WHERE user_id = ? AND media_id = ?`).bind(userId, parseInt(data.replace('fav_del_', ''))).run();
     await tgAPI('answerCallbackQuery', { callback_query_id: cbId, text: "已从收藏夹移除喵！" }, env);
     await showFavoritesList(chatId, msgId, userId, 0, env);
-  } 
-  
+  }
+
   else if (data === 'leaderboard' || data.startsWith('leader_page_')) {
+    await tgAPI('answerCallbackQuery', { callback_query_id: cbId }, env);
     const page = data === 'leaderboard' ? 0 : parseInt(data.replace('leader_page_', ''));
     await showLeaderboard(chatId, msgId, page, env);
-    await tgAPI('answerCallbackQuery', { callback_query_id: cbId }, env);
   }
-  
+
   else if (data.startsWith('set_')) {
     if (chatId > 0) return tgAPI('answerCallbackQuery', { callback_query_id: cbId, text: "喵！只能在群组内使用设置面板哦！", show_alert: true }, env);
     if (!(await isAdmin(chatId, userId, env))) {
       await tgAPI('answerCallbackQuery', { callback_query_id: cbId, text: "呜呜，只有管理员才能调整籽青哦！", show_alert: true }, env);
       return;
     }
+
+    await tgAPI('answerCallbackQuery', { callback_query_id: cbId }, env);
 
     if (data === 'set_main') await showSettingsMain(chatId, msgId, env);
     else if (data === 'set_toggle_mode') await toggleSetting('display_mode', env, chatId, msgId, ['A', 'B']);
@@ -324,7 +353,7 @@ async function handleCallback(callback, env) {
       await tgAPI('answerCallbackQuery', { callback_query_id: cbId, text: "解绑成功喵！", show_alert: true }, env);
       await showUnbindList(chatId, msgId, env);
     }
-    
+
     else if (data === 'set_danger_zone') {
       const text = "⚠️ **危险操作区**\n\n这里的操作仅对当前群组生效，且不可逆喵！";
       const keyboard = [[{ text: "🧨 清空本群数据统计", callback_data: "set_clear_stats_1" }], [{ text: "🚨 彻底清空本群媒体库", callback_data: "set_clear_media_1" }], [{ text: "⬅️ 返回安全区", callback_data: "set_main" }]];
@@ -347,11 +376,10 @@ async function handleCallback(callback, env) {
     } else if (data === 'set_clear_media_do') {
       await env.D1.prepare(`DELETE FROM user_favorites WHERE media_id IN (SELECT id FROM media_library WHERE chat_id = ?)`).bind(chatId).run();
       await env.D1.prepare(`DELETE FROM served_history WHERE media_id IN (SELECT id FROM media_library WHERE chat_id = ?)`).bind(chatId).run();
-      await env.D1.prepare(`DELETE FROM media_library WHERE chat_id = ?`).bind(chatId).run(); 
+      await env.D1.prepare(`DELETE FROM media_library WHERE chat_id = ?`).bind(chatId).run();
       await tgAPI('answerCallbackQuery', { callback_query_id: cbId, text: "当前群组媒体库已被彻底清空喵！", show_alert: true }, env);
       await showSettingsMain(chatId, msgId, env);
     }
-    await tgAPI('answerCallbackQuery', { callback_query_id: cbId }, env);
   }
 }
 
@@ -394,12 +422,13 @@ async function showCategories(chatId, msgId, env, userId) {
     }
   } else {
     const allowedGroups = await getUserAllowedGroups(userId, env);
-    for (const groupId of allowedGroups) {
-      const groupRes = await env.D1.prepare(`SELECT DISTINCT category_name, chat_title FROM config_topics WHERE category_name != 'output' AND chat_id = ?`).bind(groupId).all();
-      if (groupRes.results) {
-        groupRes.results.forEach(row => {
-          keyboard.push([{ text: `📂 [${row.chat_title}] ${row.category_name}`, callback_data: `random_${row.category_name}|${groupId}` }]);
-        });
+    if (allowedGroups.length > 0) {
+      const placeholders = allowedGroups.map(() => '?').join(', ');
+      const { results } = await env.D1.prepare(
+        `SELECT DISTINCT chat_id, chat_title, category_name FROM config_topics WHERE category_name != 'output' AND chat_id IN (${placeholders}) ORDER BY chat_title, category_name`
+      ).bind(...allowedGroups).all();
+      for (const row of (results || [])) {
+        keyboard.push([{ text: `📂 [${row.chat_title}] ${row.category_name}`, callback_data: `random_${row.category_name}|${row.chat_id}` }]);
       }
     }
   }
@@ -412,7 +441,7 @@ async function showCategories(chatId, msgId, env, userId) {
 }
 
 // ==== 核心抽取与展现逻辑 (融合 方案A: 失效自动清理 & 群组炸群连坐清理) ====
-async function sendRandomMedia(userId, chatId, msgId, topicId, category, sourceChatId, isNext, env) {
+async function sendRandomMedia(userId, chatId, msgId, topicId, category, sourceChatId, isNext, env, ctx) {
   if (chatId > 0) {
     const inGroup = await isUserInGroup(sourceChatId, userId, env);
     if (!inGroup) {
@@ -423,7 +452,7 @@ async function sendRandomMedia(userId, chatId, msgId, topicId, category, sourceC
 
   let outChatId = chatId;
   let outTopicId = topicId;
-  
+
   if (chatId < 0) {
     const output = await env.D1.prepare(`SELECT chat_id, topic_id FROM config_topics WHERE category_name = 'output' AND chat_id = ? LIMIT 1`).bind(chatId).first();
     if (!output) return tgAPI('sendMessage', { chat_id: chatId, message_thread_id: topicId, text: `喵？管理员还没设置本群输出话题呢，请用 /bind_output 设置！` }, env);
@@ -431,23 +460,28 @@ async function sendRandomMedia(userId, chatId, msgId, topicId, category, sourceC
     outTopicId = output.topic_id;
   }
 
-  const mode = await getSetting(sourceChatId, 'display_mode', env);
-  const useAntiRepeat = (await getSetting(sourceChatId, 'anti_repeat', env)) === 'true';
-  const autoJump = (await getSetting(sourceChatId, 'auto_jump', env)) === 'true';
-  const showSuccess = (await getSetting(sourceChatId, 'show_success', env)) === 'true';
-  const nextMode = await getSetting(sourceChatId, 'next_mode', env) || 'replace'; 
+  // P1: 批量读取所有设置，1次 D1 查询替代 5次
+  const settings = await getSettingsBatch(sourceChatId, ['display_mode', 'anti_repeat', 'auto_jump', 'show_success', 'next_mode'], env);
+  const mode = settings.display_mode;
+  const useAntiRepeat = settings.anti_repeat === 'true';
+  const autoJump = settings.auto_jump === 'true';
+  const showSuccess = settings.show_success === 'true';
+  const nextMode = settings.next_mode || 'replace';
   const now = Date.now();
 
   // 连点防刷退回逻辑
   if (isNext) {
     const last = await env.D1.prepare(`SELECT * FROM last_served WHERE user_id = ?`).bind(userId).first();
     if (last && (now - last.served_at) < 30000) {
-      await env.D1.prepare(`UPDATE media_library SET view_count = MAX(0, view_count - 1) WHERE id = ?`).bind(last.last_media_id).run();
-      if (useAntiRepeat) await env.D1.prepare(`DELETE FROM served_history WHERE media_id = ?`).bind(last.last_media_id).run();
+      // P3: 非关键写入异步化
+      ctx.waitUntil(Promise.all([
+        env.D1.prepare(`UPDATE media_library SET view_count = MAX(0, view_count - 1) WHERE id = ?`).bind(last.last_media_id).run(),
+        useAntiRepeat ? env.D1.prepare(`DELETE FROM served_history WHERE media_id = ?`).bind(last.last_media_id).run() : Promise.resolve()
+      ]));
     }
   }
 
-  // 🌟 新增：方案 A 自动重试与体检循环 (最多重试 3 次，防止 CF Worker 超时)
+  // 🌟 方案 A 自动重试与体检循环 (最多重试 3 次，防止 CF Worker 超时)
   let attempts = 0;
   let foundValid = false;
   let media = null;
@@ -455,11 +489,9 @@ async function sendRandomMedia(userId, chatId, msgId, topicId, category, sourceC
 
   while (attempts < 3 && !foundValid) {
     attempts++;
-    
-    // 1. 捞取数据
-    media = useAntiRepeat 
-      ? await env.D1.prepare(`SELECT * FROM media_library WHERE category_name = ? AND chat_id = ? AND id NOT IN (SELECT media_id FROM served_history) ORDER BY RANDOM() LIMIT 1`).bind(category, sourceChatId).first() 
-      : await env.D1.prepare(`SELECT * FROM media_library WHERE category_name = ? AND chat_id = ? ORDER BY RANDOM() LIMIT 1`).bind(category, sourceChatId).first();
+
+    // 1. P1: id-pivot 随机策略替代 ORDER BY RANDOM() 全表扫描
+    media = await selectRandomMedia(category, sourceChatId, useAntiRepeat, env);
 
     // 如果防重库空了，重置防重库再捞一次
     if (!media && useAntiRepeat) {
@@ -467,10 +499,10 @@ async function sendRandomMedia(userId, chatId, msgId, topicId, category, sourceC
       if (totalCheck && totalCheck.c > 0) {
         await env.D1.prepare(`DELETE FROM served_history WHERE media_id IN (SELECT id FROM media_library WHERE category_name = ? AND chat_id = ?)`).bind(category, sourceChatId).run();
         await tgAPI('sendMessage', { chat_id: outChatId, message_thread_id: outTopicId, text: `🎉 哇哦，【${category}】的内容全看光了！籽青已重置防重库喵~` }, env);
-        media = await env.D1.prepare(`SELECT * FROM media_library WHERE category_name = ? AND chat_id = ? ORDER BY RANDOM() LIMIT 1`).bind(category, sourceChatId).first();
+        media = await selectRandomMedia(category, sourceChatId, false, env);
       }
     }
-    
+
     if (!media) {
       await tgAPI('sendMessage', { chat_id: chatId, message_thread_id: topicId, text: `呜呜，该分类里还没有内容呢喵~` }, env);
       return;
@@ -504,41 +536,37 @@ async function sendRandomMedia(userId, chatId, msgId, topicId, category, sourceC
 
     // 4. 分析探活结果
     if (data.ok) {
-      foundValid = true; // 发送成功，打断循环！
+      foundValid = true;
     } else {
-      // 🚨 探活失败！清道夫模式启动！
       const errDesc = data.description || '';
       console.error("探活报错喵:", errDesc);
-      
+
       if (errDesc.includes('chat not found') || errDesc.includes('bot was kicked') || errDesc.includes('channel not found')) {
-        // 炸群/被踢了：一刀切，连坐清理整个群的图库和分类！
         await env.D1.prepare(`DELETE FROM media_library WHERE chat_id = ?`).bind(media.chat_id).run();
         await env.D1.prepare(`DELETE FROM config_topics WHERE chat_id = ?`).bind(media.chat_id).run();
-        await env.D1.prepare(`DELETE FROM group_federation WHERE from_chat = ? OR to_chat = ?`).bind(media.chat_id, media.chat_id).run(); // 顺便解散联盟关系
       } else {
-        // 只是单条消息被撤回或失效：精确删除这一条
         await env.D1.prepare(`DELETE FROM media_library WHERE id = ?`).bind(media.id).run();
       }
-      // 继续下一轮循环，自动捞新图...
     }
   }
 
   // ==== 循环结束后的收尾工作 ====
   if (!foundValid) {
-    // 如果重试 3 次都抽到了死链，告诉用户让服务器喘口气
-    return tgAPI('answerCallbackQuery', { callback_query_id: cbId, text: "🧹 呼... 连续抽到好多失效图片，籽青已经把坏数据打扫干净啦，请主人再点一次重抽喵！", show_alert: true }, env);
+    return tgAPI('sendMessage', { chat_id: chatId, message_thread_id: topicId, text: "🧹 呼... 连续抽到好多失效图片，籽青已经把坏数据打扫干净啦，请主人再点一次重抽喵！" }, env);
   }
 
-  // 记录健康数据的浏览统计
-  if (useAntiRepeat) await env.D1.prepare(`INSERT OR IGNORE INTO served_history (media_id) VALUES (?)`).bind(media.id).run();
-  await env.D1.prepare(`INSERT INTO last_served (user_id, last_media_id, served_at) VALUES (?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET last_media_id=excluded.last_media_id, served_at=excluded.served_at`).bind(userId, media.id, now).run();
-  await env.D1.prepare(`UPDATE media_library SET view_count = view_count + 1 WHERE id = ?`).bind(media.id).run();
+  // P3: 统计写入全部异步化，不阻塞响应
+  ctx.waitUntil(Promise.all([
+    useAntiRepeat ? env.D1.prepare(`INSERT OR IGNORE INTO served_history (media_id) VALUES (?)`).bind(media.id).run() : Promise.resolve(),
+    env.D1.prepare(`INSERT INTO last_served (user_id, last_media_id, served_at) VALUES (?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET last_media_id=excluded.last_media_id, served_at=excluded.served_at`).bind(userId, media.id, now).run(),
+    env.D1.prepare(`UPDATE media_library SET view_count = view_count + 1 WHERE id = ?`).bind(media.id).run()
+  ]));
 
   // 成功抽取的反馈提示
   if (!isNext && chatId < 0) {
     if (showSuccess) {
       const jumpToOutputLink = newSentMessageId ? makeDeepLink(outChatId, newSentMessageId) : null;
-      const jumpKeyboard = jumpToOutputLink && autoJump 
+      const jumpKeyboard = jumpToOutputLink && autoJump
         ? [[{ text: "🚀 飞去看看", url: jumpToOutputLink }], [{ text: "🏠 返回", callback_data: "main_menu" }]]
         : [[{ text: "🏠 返回", callback_data: "main_menu" }]];
       await tgAPI('editMessageText', { chat_id: chatId, message_id: msgId, text: `🎉 抽取成功啦喵！已发送至输出话题。`, reply_markup: { inline_keyboard: jumpKeyboard } }, env);
@@ -553,8 +581,11 @@ async function showLeaderboard(chatId, msgId, page, env) {
   const offset = page * limit;
   if (chatId > 0) return tgAPI('editMessageText', { chat_id: chatId, message_id: msgId, text: "喵，私聊模式暂不支持查看群排行哦，请在群组内使用 QwQ", reply_markup: getBackMarkup() }, env);
 
-  const { results } = await env.D1.prepare(`SELECT chat_id, message_id, category_name, view_count, caption FROM media_library WHERE view_count > 0 AND chat_id = ? ORDER BY view_count DESC LIMIT ? OFFSET ?`).bind(chatId, limit, offset).all();
-  const totalRes = await env.D1.prepare(`SELECT count(*) as c FROM media_library WHERE view_count > 0 AND chat_id = ?`).bind(chatId).first();
+  const [leaderData, totalRes] = await Promise.all([
+    env.D1.prepare(`SELECT chat_id, message_id, category_name, view_count, caption FROM media_library WHERE view_count > 0 AND chat_id = ? ORDER BY view_count DESC LIMIT ? OFFSET ?`).bind(chatId, limit, offset).all(),
+    env.D1.prepare(`SELECT count(*) as c FROM media_library WHERE view_count > 0 AND chat_id = ?`).bind(chatId).first()
+  ]);
+  const results = leaderData.results;
   
   let text = "🏆 **本群浏览量排行榜喵**\n\n";
   if (!results || results.length === 0) {
@@ -618,12 +649,14 @@ async function viewFavorite(chatId, topicId, mediaId, env) {
 
 // ==== V5.5 专属设置看板 (基于 chat_id 获取独立配置) ====
 async function showSettingsMain(chatId, msgId, env) {
-  const mode = await getSetting(chatId, 'display_mode', env);
-  const repeat = await getSetting(chatId, 'anti_repeat', env);
-  const jump = await getSetting(chatId, 'auto_jump', env);
-  const dup = await getSetting(chatId, 'dup_notify', env);
-  const showSuccess = await getSetting(chatId, 'show_success', env);
-  const nextMode = await getSetting(chatId, 'next_mode', env);
+  // P1: 批量读取所有设置，1次 D1 查询替代 6次
+  const settings = await getSettingsBatch(chatId, ['display_mode', 'anti_repeat', 'auto_jump', 'dup_notify', 'show_success', 'next_mode'], env);
+  const mode = settings.display_mode;
+  const repeat = settings.anti_repeat;
+  const jump = settings.auto_jump;
+  const dup = settings.dup_notify;
+  const showSuccess = settings.show_success;
+  const nextMode = settings.next_mode;
   
   const text = "⚙️ **本群的独立控制面板喵**\n\n请主人调整下方的功能开关：";
   const keyboard = [
@@ -661,8 +694,12 @@ async function showUnbindList(chatId, msgId, env) {
 }
 
 async function showStats(chatId, msgId, env) {
-  const mediaCount = (await env.D1.prepare(`SELECT count(*) as c FROM media_library WHERE chat_id = ?`).bind(chatId).first()).c;
-  const topicCount = (await env.D1.prepare(`SELECT count(*) as c FROM config_topics WHERE chat_id = ?`).bind(chatId).first()).c;
+  const [mediaRes, topicRes] = await Promise.all([
+    env.D1.prepare(`SELECT count(*) as c FROM media_library WHERE chat_id = ?`).bind(chatId).first(),
+    env.D1.prepare(`SELECT count(*) as c FROM config_topics WHERE chat_id = ?`).bind(chatId).first()
+  ]);
+  const mediaCount = mediaRes?.c || 0;
+  const topicCount = topicRes?.c || 0;
   const text = `📊 **本群数据看板喵**\n\n- 本群收录媒体: **${mediaCount}** 条\n- 本群绑定话题: **${topicCount}** 个`;
   await tgAPI('editMessageText', { chat_id: chatId, message_id: msgId, text, parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{text: "⬅️ 返回设置", callback_data: "set_main"}]] } }, env);
 }
@@ -677,20 +714,32 @@ function getBackMarkup() {
 async function getUserAllowedGroups(userId, env) {
   const { results } = await env.D1.prepare(`SELECT DISTINCT chat_id FROM config_topics WHERE chat_id < 0`).all();
   if (!results || results.length === 0) return [];
-  
-  let allowed = [];
-  for (const row of results) {
-    const inGroup = await isUserInGroup(row.chat_id, userId, env);
-    if (inGroup) allowed.push(row.chat_id);
-  }
-  return allowed;
+
+  // P0: 并发检查所有群组，替代串行 for loop
+  const checks = results.map(row =>
+    isUserInGroup(row.chat_id, userId, env).then(inGroup => inGroup ? row.chat_id : null)
+  );
+  return (await Promise.all(checks)).filter(id => id !== null);
 }
 
 async function isUserInGroup(groupId, userId, env) {
+  // P0: TTL 缓存，避免对同一用户/群组重复调用 Telegram API
+  const cacheKey = `${groupId}:${userId}`;
+  const now = Date.now();
+  const cached = groupMembershipCache.get(cacheKey);
+  if (cached && cached.expiresAt > now) return cached.value;
+
   const res = await tgAPI('getChatMember', { chat_id: groupId, user_id: userId }, env);
   const data = await res.json();
-  if (!data.ok) return false;
-  return ['creator', 'administrator', 'member', 'restricted'].includes(data.result.status);
+  const inGroup = data.ok && ['creator', 'administrator', 'member', 'restricted'].includes(data.result.status);
+
+  // 写入缓存，LRU 超限时淘汰最旧条目
+  if (groupMembershipCache.size >= GROUP_MEMBER_CACHE_MAX) {
+    groupMembershipCache.delete(groupMembershipCache.keys().next().value);
+  }
+  groupMembershipCache.set(cacheKey, { value: inGroup, expiresAt: now + GROUP_MEMBER_CACHE_TTL_MS });
+
+  return inGroup;
 }
 
 async function handleExternalImport(dataBatch, env) {
@@ -712,17 +761,46 @@ async function tgAPI(method, payload, env) {
 async function getSetting(chatId, key, env) {
   const res = await env.D1.prepare(`SELECT value FROM chat_settings WHERE chat_id = ? AND key = ?`).bind(chatId, key).first();
   if (res) return res.value;
-  
-  // 如果群组没有设置过，就返回默认值喵
-  const defaults = {
-    'display_mode': 'B',
-    'anti_repeat': 'true',
-    'auto_jump': 'true',
-    'dup_notify': 'false',
-    'show_success': 'true',
-    'next_mode': 'replace'
-  };
-  return defaults[key] || null;
+  return SETTING_DEFAULTS[key] ?? null;
+}
+
+// P1: 批量读取多个设置，单次 D1 查询
+async function getSettingsBatch(chatId, keys, env) {
+  const uniqueKeys = [...new Set(keys)];
+  const placeholders = uniqueKeys.map(() => '?').join(', ');
+  const { results } = await env.D1.prepare(
+    `SELECT key, value FROM chat_settings WHERE chat_id = ? AND key IN (${placeholders})`
+  ).bind(chatId, ...uniqueKeys).all();
+  const out = {};
+  for (const k of uniqueKeys) out[k] = SETTING_DEFAULTS[k] ?? null;
+  for (const row of (results || [])) out[row.key] = row.value;
+  return out;
+}
+
+// P1: id-pivot 随机策略，替代 ORDER BY RANDOM() 全表扫描
+// 原理：随机选取一个 id pivot，优先找 id >= pivot 的第一条，找不到则回绕找 id < pivot 的第一条
+async function selectRandomMedia(category, sourceChatId, useAntiRepeat, env) {
+  const maxRow = await env.D1.prepare(
+    `SELECT MAX(id) AS max_id FROM media_library WHERE category_name = ? AND chat_id = ?`
+  ).bind(category, sourceChatId).first();
+  if (!maxRow || maxRow.max_id === null) return null;
+
+  const pivot = Math.floor(Math.random() * maxRow.max_id) + 1;
+  const antiClause = useAntiRepeat
+    ? `AND NOT EXISTS (SELECT 1 FROM served_history sh WHERE sh.media_id = m.id)`
+    : '';
+
+  // 先找 id >= pivot 的第一条
+  let media = await env.D1.prepare(
+    `SELECT * FROM media_library m WHERE m.category_name = ? AND m.chat_id = ? ${antiClause} AND m.id >= ? ORDER BY m.id LIMIT 1`
+  ).bind(category, sourceChatId, pivot).first();
+
+  if (media) return media;
+
+  // 回绕：找 id < pivot 的最后一条（按 id 升序取第一条等价）
+  return env.D1.prepare(
+    `SELECT * FROM media_library m WHERE m.category_name = ? AND m.chat_id = ? ${antiClause} AND m.id < ? ORDER BY m.id LIMIT 1`
+  ).bind(category, sourceChatId, pivot).first();
 }
 
 async function isAdmin(chatId, userId, env) {

@@ -59,7 +59,7 @@ async function handleSetup(origin, env) {
   try {
     const initSQL = [
       `CREATE TABLE IF NOT EXISTS config_topics (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER, chat_title TEXT, topic_id INTEGER, category_name TEXT, bound_by INTEGER, created_at DATETIME DEFAULT CURRENT_TIMESTAMP);`,
-      `CREATE TABLE IF NOT EXISTS media_library (id INTEGER PRIMARY KEY AUTOINCREMENT, message_id INTEGER, chat_id INTEGER, topic_id INTEGER, category_name TEXT, view_count INTEGER DEFAULT 0, file_unique_id TEXT, file_id TEXT, media_type TEXT, caption TEXT, added_at DATETIME DEFAULT CURRENT_TIMESTAMP);`,
+      `CREATE TABLE IF NOT EXISTS media_library (id INTEGER PRIMARY KEY AUTOINCREMENT, message_id INTEGER, chat_id INTEGER, topic_id INTEGER, category_name TEXT, view_count INTEGER DEFAULT 0, file_unique_id TEXT, file_id TEXT, media_type TEXT, caption TEXT, added_at DATETIME DEFAULT CURRENT_TIMESTAMP);`，
       `CREATE TABLE IF NOT EXISTS user_favorites (user_id INTEGER, media_id INTEGER, saved_at DATETIME DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(user_id, media_id));`,
       `CREATE TABLE IF NOT EXISTS last_served (user_id INTEGER PRIMARY KEY, last_media_id INTEGER, served_at INTEGER);`,
       `CREATE TABLE IF NOT EXISTS served_history (media_id INTEGER PRIMARY KEY);`,
@@ -71,7 +71,7 @@ async function handleSetup(origin, env) {
       // V5.5.1 性能索引
       `CREATE INDEX IF NOT EXISTS idx_media_chat_cat_id ON media_library (chat_id, category_name, id);`,
       `CREATE INDEX IF NOT EXISTS idx_media_chat_viewcount ON media_library (chat_id, view_count DESC);`,
-      `CREATE INDEX IF NOT EXISTS idx_topics_chat_cat ON config_topics (chat_id, category_name);`,
+      `CREATE INDEX IF NOT EXISTS idx_topics_chat_cat ON config_topics (chat_id, category_name);`，
       `CREATE INDEX IF NOT EXISTS idx_served_history_media ON served_history (media_id);`
     ];
 
@@ -246,6 +246,201 @@ async function handleSetup(origin, env) {
             40%, 60% { transform: translate3d(4px, 0, 0); }
           }
 
+/* =========================================================================
+ * 部署与初始化逻辑
+ * ========================================================================= */
+async function handleSetup(origin, env) {
+  try {
+    const initSQL = [
+      `CREATE TABLE IF NOT EXISTS config_topics (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER, chat_title TEXT, topic_id INTEGER, category_name TEXT, bound_by INTEGER, created_at DATETIME DEFAULT CURRENT_TIMESTAMP);`,
+      `CREATE TABLE IF NOT EXISTS media_library (id INTEGER PRIMARY KEY AUTOINCREMENT, message_id INTEGER, chat_id INTEGER, topic_id INTEGER, category_name TEXT, view_count INTEGER DEFAULT 0, file_unique_id TEXT, file_id TEXT, media_type TEXT, caption TEXT, added_at DATETIME DEFAULT CURRENT_TIMESTAMP);`,
+      `CREATE TABLE IF NOT EXISTS user_favorites (user_id INTEGER, media_id INTEGER, saved_at DATETIME DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(user_id, media_id));`,
+      `CREATE TABLE IF NOT EXISTS last_served (user_id INTEGER PRIMARY KEY, last_media_id INTEGER, served_at INTEGER);`,
+      `CREATE TABLE IF NOT EXISTS served_history (media_id INTEGER PRIMARY KEY);`,
+      
+      // V5.5 核心升级：新建带有 chat_id 的群组独立配置表
+      `CREATE TABLE IF NOT EXISTS chat_settings (chat_id INTEGER, key TEXT, value TEXT, PRIMARY KEY(chat_id, key));`,
+      // 兼容旧版留存
+      `CREATE TABLE IF NOT EXISTS bot_settings (key TEXT PRIMARY KEY, value TEXT);`,
+      // V5.5.1 性能索引
+      `CREATE INDEX IF NOT EXISTS idx_media_chat_cat_id ON media_library (chat_id, category_name, id);`,
+      `CREATE INDEX IF NOT EXISTS idx_media_chat_viewcount ON media_library (chat_id, view_count DESC);`,
+      `CREATE INDEX IF NOT EXISTS idx_topics_chat_cat ON config_topics (chat_id, category_name);`,
+      `CREATE INDEX IF NOT EXISTS idx_served_history_media ON served_history (media_id);`
+    ];
+
+    for (const sql of initSQL) await env.D1.prepare(sql).run();
+
+    const columns = ['file_unique_id', 'file_id', 'media_type', 'caption'];
+    for (const col of columns) {
+      try { await env.D1.prepare(`ALTER TABLE media_library ADD COLUMN ${col} TEXT;`).run(); } catch (e) {}
+    }
+
+    const webhookUrl = `${origin}/webhook`;
+    const tgRes = await tgAPI('setWebhook', { url: webhookUrl }, env);
+    if (!tgRes.ok) throw new Error('Webhook 注册失败');
+
+    const html = `
+      <!DOCTYPE html>
+      <html lang="zh-CN">
+      <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>籽青 (Ziqing) - 核心控制枢纽 🐾</title>
+        <style>
+          @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;700&display=swap');
+          
+          body { 
+            font-family: 'Noto Sans SC', system-ui, sans-serif; 
+            display: flex; justify-content: center; align-items: center; 
+            min-height: 100vh; margin: 0; 
+            background: linear-gradient(135deg, #fdfbfb 0%, #ebedee 100%);
+            overflow: hidden;
+            color: #4a4a4a;
+          }
+          
+          /* 背景装饰圆块 */
+          .blob-1 { position: absolute; top: -10%; left: -10%; width: 400px; height: 400px; background: rgba(255, 182, 193, 0.4); border-radius: 50%; filter: blur(60px); z-index: 0; }
+          .blob-2 { position: absolute; bottom: -10%; right: -10%; width: 350px; height: 350px; background: rgba(161, 196, 253, 0.4); border-radius: 50%; filter: blur(60px); z-index: 0; }
+
+          /* 毛玻璃主卡片 */
+          .glass-card { 
+            background: rgba(255, 255, 255, 0.7); 
+            backdrop-filter: blur(20px); 
+            -webkit-backdrop-filter: blur(20px); 
+            border: 1px solid rgba(255, 255, 255, 0.8); 
+            padding: 3rem 3rem 2.5rem; 
+            border-radius: 28px; 
+            box-shadow: 0 20px 40px rgba(0,0,0,0.08), inset 0 0 0 1px rgba(255,255,255,0.5); 
+            text-align: center; 
+            max-width: 480px; 
+            width: 90%;
+            position: relative; 
+            z-index: 1;
+            animation: slideUp 0.6s cubic-bezier(0.16, 1, 0.3, 1); 
+          }
+
+          @keyframes slideUp { 
+            from { transform: translateY(40px); opacity: 0; } 
+            to { transform: translateY(0); opacity: 1; } 
+          }
+
+          /* 悬浮猫猫头像 */
+          .avatar { 
+            font-size: 4.5rem; 
+            margin-top: -5.5rem; 
+            margin-bottom: 1rem; 
+            display: inline-block; 
+            background: white;
+            border-radius: 50%;
+            padding: 10px;
+            box-shadow: 0 10px 20px rgba(255, 117, 140, 0.2);
+            animation: float 3s infinite ease-in-out; 
+          }
+
+          @keyframes float { 
+            0%, 100% { transform: translateY(0); } 
+            50% { transform: translateY(-10px); } 
+          }
+
+          h1 { 
+            background: linear-gradient(135deg, #ff758c 0%, #ff7eb3 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 0.8rem; 
+            font-size: 1.8rem; 
+            font-weight: 700; 
+          }
+
+          p { line-height: 1.6; font-size: 0.95rem; margin-bottom: 1.5rem; }
+
+          /* 代码框内嵌发光效果 */
+          .code-box { 
+            background: rgba(255, 255, 255, 0.9); 
+            padding: 1rem; 
+            border-radius: 12px; 
+            border: 1px dashed #ffb6c1; 
+            font-family: 'Courier New', monospace; 
+            word-break: break-all; 
+            color: #ff0844; 
+            font-weight: bold; 
+            font-size: 0.9rem; 
+            box-shadow: inset 0 2px 5px rgba(0,0,0,0.03); 
+            transition: all 0.3s ease;
+          }
+          .code-box:hover { border-color: #ff758c; transform: scale(1.02); }
+
+          .highlight { color: #ff7eb3; font-weight: bold; }
+          .footer { margin-top: 2rem; font-size: 0.8rem; color: #a0aabf; font-weight: 600; letter-spacing: 1px;}
+        </style>
+      </head>
+      <body>
+        <div class="blob-1"></div>
+        <div class="blob-2"></div>
+        <div class="glass-card">
+          <div class="avatar">🐱</div>
+          <h1>🎉 籽青 V5.5.2 满血上线！</h1>
+          <p>性能已优化，多群组数据安全隔离应该正常！<br>Webhook 已经帮主人狠狠地绑死啦：</p>
+          <div class="code-box">${webhookUrl}</div>
+          <p style="margin-top: 1.5rem;">快去 Telegram 里找 <span class="highlight">籽青</span> 玩耍吧！QwQ</p>
+          <div class="footer">Powered by Cloudflare Workers & D1</div>
+        </div>
+      </body>
+      </html>
+    `;
+    return new Response(html, { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
+
+  } catch (error) {
+    console.error('部署失败喵:', error);
+    
+    // 部署失败时的毛玻璃报错界面
+    const errorHtml = `
+      <!DOCTYPE html>
+      <html lang="zh-CN">
+      <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>籽青摔倒了喵！</title>
+        <style>
+          @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;700&display=swap');
+          
+          body { 
+            font-family: 'Noto Sans SC', system-ui, sans-serif; 
+            display: flex; justify-content: center; align-items: center; 
+            min-height: 100vh; margin: 0; 
+            background: linear-gradient(135deg, #fdfbfb 0%, #ebedee 100%);
+            overflow: hidden;
+            color: #4a4a4a;
+          }
+          
+          /* 背景装饰圆块 - 报错红紫配色 */
+          .blob-1 { position: absolute; top: -10%; left: -10%; width: 400px; height: 400px; background: rgba(255, 99, 132, 0.3); border-radius: 50%; filter: blur(60px); z-index: 0; }
+          .blob-2 { position: absolute; bottom: -10%; right: -10%; width: 350px; height: 350px; background: rgba(155, 89, 182, 0.3); border-radius: 50%; filter: blur(60px); z-index: 0; }
+
+          /* 毛玻璃主卡片 - 加入错误抖动动画 */
+          .glass-card { 
+            background: rgba(255, 255, 255, 0.7); 
+            backdrop-filter: blur(20px); 
+            -webkit-backdrop-filter: blur(20px); 
+            border: 1px solid rgba(255, 255, 255, 0.8); 
+            padding: 3rem 3rem 2.5rem; 
+            border-radius: 28px; 
+            box-shadow: 0 20px 40px rgba(255, 0, 0, 0.05), inset 0 0 0 1px rgba(255,255,255,0.5); 
+            text-align: center; 
+            max-width: 480px; 
+            width: 90%;
+            position: relative; 
+            z-index: 1;
+            animation: shake 0.6s cubic-bezier(.36,.07,.19,.97) both;
+          }
+
+          @keyframes shake {
+            10%, 90% { transform: translate3d(-1px, 0, 0); }
+            20%, 80% { transform: translate3d(2px, 0, 0); }
+            30%, 50%, 70% { transform: translate3d(-4px, 0, 0); }
+            40%, 60% { transform: translate3d(4px, 0, 0); }
+          }
+
           /* 悬浮猫猫头像 - 哭泣 */
           .avatar { 
             font-size: 4.5rem; 
@@ -300,7 +495,7 @@ async function handleSetup(origin, env) {
         <div class="blob-2"></div>
         <div class="glass-card">
           <div class="avatar">😿</div>
-          <h1>呜呜，摔倒了喵...</h1>
+          <h1>呜呜，籽青摔倒了喵...</h1>
           <p>部署过程中出现了一点小意外！<br>请主人检查一下 <span class="highlight">D1 数据库绑定</span> 或者 <span class="highlight">BOT_TOKEN</span> 哦：</p>
           <div class="code-box">${error.message}</div>
           <p style="margin-top: 1.5rem;">修好之后再刷新一下这个页面就可以啦！QwQ</p>
@@ -311,7 +506,6 @@ async function handleSetup(origin, env) {
     `;
     return new Response(errorHtml, { status: 500, headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
   }
-}
 }
 
 /* =========================================================================

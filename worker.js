@@ -87,7 +87,6 @@ async function handleSetup(origin, env) {
     if (!tgRes.ok) throw new Error('Webhook 注册失败');
 
     const html = `
-        const html = `
       <!DOCTYPE html>
       <html lang="zh-CN">
       <head>
@@ -187,7 +186,7 @@ async function handleSetup(origin, env) {
         <div class="glass-card">
           <div class="avatar">🐱</div>
           <h1>🎉 籽青 V5.5.1 满血上线！</h1>
-          <p>底层性能已拉满，多群组数据安全隔离启动！<br>Webhook 已经帮主人狠狠地绑死啦：</p>
+          <p>性能已优化，多群组数据安全隔离应该正常！<br>Webhook 已经帮主人狠狠地绑死啦：</p>
           <div class="code-box">${webhookUrl}</div>
           <p style="margin-top: 1.5rem;">快去 Telegram 里找 <span class="highlight">籽青</span> 玩耍吧！QwQ</p>
           <div class="footer">Powered by Cloudflare Workers & D1</div>
@@ -196,9 +195,123 @@ async function handleSetup(origin, env) {
       </html>
     `;
     return new Response(html, { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
-  } catch (error) {
-    return new Response(`部署失败喵: ${error.message}`, { status: 500 });
+    } catch (error) {
+    console.error('部署失败喵:', error);
+    
+    // 部署失败时的毛玻璃报错界面
+    const errorHtml = `
+      <!DOCTYPE html>
+      <html lang="zh-CN">
+      <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>摔倒了喵！</title>
+        <style>
+          @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;700&display=swap');
+          
+          body { 
+            font-family: 'Noto Sans SC', system-ui, sans-serif; 
+            display: flex; justify-content: center; align-items: center; 
+            min-height: 100vh; margin: 0; 
+            background: linear-gradient(135deg, #fdfbfb 0%, #ebedee 100%);
+            overflow: hidden;
+            color: #4a4a4a;
+          }
+          
+          /* 背景装饰圆块 - 报错红紫配色 */
+          .blob-1 { position: absolute; top: -10%; left: -10%; width: 400px; height: 400px; background: rgba(255, 99, 132, 0.3); border-radius: 50%; filter: blur(60px); z-index: 0; }
+          .blob-2 { position: absolute; bottom: -10%; right: -10%; width: 350px; height: 350px; background: rgba(155, 89, 182, 0.3); border-radius: 50%; filter: blur(60px); z-index: 0; }
+
+          /* 毛玻璃主卡片 - 加入错误抖动动画 */
+          .glass-card { 
+            background: rgba(255, 255, 255, 0.7); 
+            backdrop-filter: blur(20px); 
+            -webkit-backdrop-filter: blur(20px); 
+            border: 1px solid rgba(255, 255, 255, 0.8); 
+            padding: 3rem 3rem 2.5rem; 
+            border-radius: 28px; 
+            box-shadow: 0 20px 40px rgba(255, 0, 0, 0.05), inset 0 0 0 1px rgba(255,255,255,0.5); 
+            text-align: center; 
+            max-width: 480px; 
+            width: 90%;
+            position: relative; 
+            z-index: 1;
+            animation: shake 0.6s cubic-bezier(.36,.07,.19,.97) both;
+          }
+
+          @keyframes shake {
+            10%, 90% { transform: translate3d(-1px, 0, 0); }
+            20%, 80% { transform: translate3d(2px, 0, 0); }
+            30%, 50%, 70% { transform: translate3d(-4px, 0, 0); }
+            40%, 60% { transform: translate3d(4px, 0, 0); }
+          }
+
+          /* 悬浮猫猫头像 - 哭泣 */
+          .avatar { 
+            font-size: 4.5rem; 
+            margin-top: -5.5rem; 
+            margin-bottom: 1rem; 
+            display: inline-block; 
+            background: white;
+            border-radius: 50%;
+            padding: 10px;
+            box-shadow: 0 10px 20px rgba(255, 99, 132, 0.2);
+            animation: float 3s infinite ease-in-out; 
+          }
+
+          @keyframes float { 
+            0%, 100% { transform: translateY(0); } 
+            50% { transform: translateY(-10px); } 
+          }
+
+          h1 { 
+            background: linear-gradient(135deg, #ff416c 0%, #ff4b2b 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 0.8rem; 
+            font-size: 1.8rem; 
+            font-weight: 700; 
+          }
+
+          p { line-height: 1.6; font-size: 0.95rem; margin-bottom: 1.5rem; }
+
+          /* 代码框内嵌发光效果 - 危险红 */
+          .code-box { 
+            background: rgba(255, 240, 245, 0.9); 
+            padding: 1rem; 
+            border-radius: 12px; 
+            border: 1px dashed #ff416c; 
+            font-family: 'Courier New', monospace; 
+            word-break: break-all; 
+            color: #d32f2f; 
+            font-weight: bold; 
+            font-size: 0.9rem; 
+            box-shadow: inset 0 2px 5px rgba(255,0,0,0.05); 
+            transition: all 0.3s ease;
+          }
+          .code-box:hover { border-color: #ff4b2b; transform: scale(1.02); }
+
+          .highlight { color: #ff4b2b; font-weight: bold; }
+          .footer { margin-top: 2rem; font-size: 0.8rem; color: #a0aabf; font-weight: 600; letter-spacing: 1px;}
+        </style>
+      </head>
+      <body>
+        <div class="blob-1"></div>
+        <div class="blob-2"></div>
+        <div class="glass-card">
+          <div class="avatar">😿</div>
+          <h1>呜呜，摔倒了喵...</h1>
+          <p>部署过程中出现了一点小意外！<br>请主人检查一下 <span class="highlight">D1 数据库绑定</span> 或者 <span class="highlight">BOT_TOKEN</span> 哦：</p>
+          <div class="code-box">${error.message}</div>
+          <p style="margin-top: 1.5rem;">修好之后再刷新一下这个页面就可以啦！QwQ</p>
+          <div class="footer">Powered by Cloudflare Workers & D1</div>
+        </div>
+      </body>
+      </html>
+    `;
+    return new Response(errorHtml, { status: 500, headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
   }
+}
 }
 
 /* =========================================================================

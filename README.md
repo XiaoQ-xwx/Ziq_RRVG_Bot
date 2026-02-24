@@ -5,7 +5,7 @@
 ## 注意！！！！
 
 本项目99%都由AI编写
-使用的模型为：Google Gemini Pro
+使用的模型为：Google Gemini Pro/Claude Opus 4.6/Codex
 
 ## ✨ 核心特性
 

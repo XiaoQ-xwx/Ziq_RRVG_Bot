@@ -1,7 +1,7 @@
 /**
- * Cloudflare Workers (Pages) - Telegram Bot Entry Point (V5.5 独立配置版)
- * 核心升级：修复全局设置串线问题,为每个群组引入完全独立的设置面板,Add JSON 直导。
- * V5.6 性能优化：批量设置查询、并发成员校验、id-pivot随机、ctx.waitUntil写入异步化,添加web
+ * Cloudflare Workers (Pages) - Telegram Bot Entry Point (V5.6.2)
+ * 核心升级：修复代码压缩导致的丢失功能，完整保留 auto_jump 和完整文件解析。
+ * 新增功能：增加无限回退、快捷回复 /del /move 管理、超强可视化数据看板、用户花名册。
  */
 
 /* =========================================================================
@@ -13,10 +13,11 @@ const SETTING_DEFAULTS = Object.freeze({
   auto_jump: 'true',
   dup_notify: 'false',
   show_success: 'true',
-  next_mode: 'replace'
+  next_mode: 'replace',
+  strict_skip: 'false' // 🌟 默认不是严格模式（放回池子）
 });
 
-// 成员资格 TTL 缓存（60秒）,避免重复调用 Telegram getChatMember API
+// 成员资格 TTL 缓存（60秒）
 const GROUP_MEMBER_CACHE_TTL_MS = 60_000;
 const GROUP_MEMBER_CACHE_MAX = 4096;
 const groupMembershipCache = new Map();
@@ -29,15 +30,22 @@ export default {
       if (request.method === 'GET' && url.pathname === '/') {
         return await handleSetup(url.origin, env);
       }
-
-      // 👇 新增：Telegram Web App 的专属前端网页入口
+      
+      // Telegram Web App 的专属前端网页入口
       if (request.method === 'GET' && url.pathname === '/webapp') {
         return new Response(getWebAppHTML(), { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
       }
       
-      // 👇 新增：Web App 用来拉取底层数据的后端 API 接口 (先占个位)
       if (request.method === 'POST' && url.pathname === '/api/webapp/data') {
         return await handleWebAppData(request, env);
+      }
+      
+      if (request.method === 'POST' && url.pathname === '/api/webapp/remove_fav') {
+        return await handleWebAppRemoveFav(request, env);
+      }
+
+      if (request.method === 'POST' && url.pathname === '/api/webapp/remove_hist') {
+        return await handleWebAppRemoveHist(request, env);
       }
 
       if (request.method === 'POST' && url.pathname === '/webhook') {
@@ -73,16 +81,23 @@ async function handleSetup(origin, env) {
       `CREATE TABLE IF NOT EXISTS user_favorites (user_id INTEGER, media_id INTEGER, saved_at DATETIME DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(user_id, media_id));`,
       `CREATE TABLE IF NOT EXISTS last_served (user_id INTEGER PRIMARY KEY, last_media_id INTEGER, served_at INTEGER);`,
       `CREATE TABLE IF NOT EXISTS served_history (media_id INTEGER PRIMARY KEY);`,
-      
-      // V5.5 核心升级：新建带有 chat_id 的群组独立配置表
       `CREATE TABLE IF NOT EXISTS chat_settings (chat_id INTEGER, key TEXT, value TEXT, PRIMARY KEY(chat_id, key));`,
-      // 兼容旧版留存
       `CREATE TABLE IF NOT EXISTS bot_settings (key TEXT PRIMARY KEY, value TEXT);`,
-      // V5.5.1 性能索引
+      
       `CREATE INDEX IF NOT EXISTS idx_media_chat_cat_id ON media_library (chat_id, category_name, id);`,
       `CREATE INDEX IF NOT EXISTS idx_media_chat_viewcount ON media_library (chat_id, view_count DESC);`,
       `CREATE INDEX IF NOT EXISTS idx_topics_chat_cat ON config_topics (chat_id, category_name);`,
-      `CREATE INDEX IF NOT EXISTS idx_served_history_media ON served_history (media_id);`
+      `CREATE INDEX IF NOT EXISTS idx_served_history_media ON served_history (media_id);`,
+      
+      `CREATE TABLE IF NOT EXISTS user_history (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, chat_id INTEGER, media_id INTEGER, viewed_at DATETIME DEFAULT CURRENT_TIMESTAMP);`,
+      `CREATE TABLE IF NOT EXISTS group_history (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER, media_id INTEGER, viewed_at DATETIME DEFAULT CURRENT_TIMESTAMP);`,
+      
+      // 🌟 新增：用户花名册
+      `CREATE TABLE IF NOT EXISTS user_roster (user_id INTEGER PRIMARY KEY, first_name TEXT, last_name TEXT, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP);`,
+
+      // 触发器：维持历史记录在50条
+      `CREATE TRIGGER IF NOT EXISTS limit_user_history AFTER INSERT ON user_history BEGIN DELETE FROM user_history WHERE id NOT IN (SELECT id FROM user_history WHERE user_id = NEW.user_id ORDER BY viewed_at DESC LIMIT 50) AND user_id = NEW.user_id; END;`,
+      `CREATE TRIGGER IF NOT EXISTS limit_group_history AFTER INSERT ON group_history BEGIN DELETE FROM group_history WHERE id NOT IN (SELECT id FROM group_history WHERE chat_id = NEW.chat_id ORDER BY viewed_at DESC LIMIT 50) AND chat_id = NEW.chat_id; END;`
     ];
 
     for (const sql of initSQL) await env.D1.prepare(sql).run();
@@ -96,6 +111,7 @@ async function handleSetup(origin, env) {
     const tgRes = await tgAPI('setWebhook', { url: webhookUrl }, env);
     if (!tgRes.ok) throw new Error('Webhook 注册失败');
 
+    // 绝美的成功页面
     const html = `
       <!DOCTYPE html>
       <html lang="zh-CN">
@@ -105,87 +121,17 @@ async function handleSetup(origin, env) {
         <title>籽青 (Ziqing) - 核心控制枢纽 🐾</title>
         <style>
           @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;700&display=swap');
-          
-          body { 
-            font-family: 'Noto Sans SC', system-ui, sans-serif; 
-            display: flex; justify-content: center; align-items: center; 
-            min-height: 100vh; margin: 0; 
-            background: linear-gradient(135deg, #fdfbfb 0%, #ebedee 100%);
-            overflow: hidden;
-            color: #4a4a4a;
-          }
-          
-          /* 背景装饰圆块 */
+          body { font-family: 'Noto Sans SC', system-ui, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; background: linear-gradient(135deg, #fdfbfb 0%, #ebedee 100%); overflow: hidden; color: #4a4a4a; }
           .blob-1 { position: absolute; top: -10%; left: -10%; width: 400px; height: 400px; background: rgba(255, 182, 193, 0.4); border-radius: 50%; filter: blur(60px); z-index: 0; }
           .blob-2 { position: absolute; bottom: -10%; right: -10%; width: 350px; height: 350px; background: rgba(161, 196, 253, 0.4); border-radius: 50%; filter: blur(60px); z-index: 0; }
-
-          /* 毛玻璃主卡片 */
-          .glass-card { 
-            background: rgba(255, 255, 255, 0.7); 
-            backdrop-filter: blur(20px); 
-            -webkit-backdrop-filter: blur(20px); 
-            border: 1px solid rgba(255, 255, 255, 0.8); 
-            padding: 3rem 3rem 2.5rem; 
-            border-radius: 28px; 
-            box-shadow: 0 20px 40px rgba(0,0,0,0.08), inset 0 0 0 1px rgba(255,255,255,0.5); 
-            text-align: center; 
-            max-width: 480px; 
-            width: 90%;
-            position: relative; 
-            z-index: 1;
-            animation: slideUp 0.6s cubic-bezier(0.16, 1, 0.3, 1); 
-          }
-
-          @keyframes slideUp { 
-            from { transform: translateY(40px); opacity: 0; } 
-            to { transform: translateY(0); opacity: 1; } 
-          }
-
-          /* 悬浮猫猫头像 */
-          .avatar { 
-            font-size: 4.5rem; 
-            margin-top: -5.5rem; 
-            margin-bottom: 1rem; 
-            display: inline-block; 
-            background: white;
-            border-radius: 50%;
-            padding: 10px;
-            box-shadow: 0 10px 20px rgba(255, 117, 140, 0.2);
-            animation: float 3s infinite ease-in-out; 
-          }
-
-          @keyframes float { 
-            0%, 100% { transform: translateY(0); } 
-            50% { transform: translateY(-10px); } 
-          }
-
-          h1 { 
-            background: linear-gradient(135deg, #ff758c 0%, #ff7eb3 100%);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            margin-bottom: 0.8rem; 
-            font-size: 1.8rem; 
-            font-weight: 700; 
-          }
-
+          .glass-card { background: rgba(255, 255, 255, 0.7); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px); border: 1px solid rgba(255, 255, 255, 0.8); padding: 3rem 3rem 2.5rem; border-radius: 28px; box-shadow: 0 20px 40px rgba(0,0,0,0.08), inset 0 0 0 1px rgba(255,255,255,0.5); text-align: center; max-width: 480px; width: 90%; position: relative; z-index: 1; animation: slideUp 0.6s cubic-bezier(0.16, 1, 0.3, 1); }
+          @keyframes slideUp { from { transform: translateY(40px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+          .avatar { font-size: 4.5rem; margin-top: -5.5rem; margin-bottom: 1rem; display: inline-block; background: white; border-radius: 50%; padding: 10px; box-shadow: 0 10px 20px rgba(255, 117, 140, 0.2); animation: float 3s infinite ease-in-out; }
+          @keyframes float { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-10px); } }
+          h1 { background: linear-gradient(135deg, #ff758c 0%, #ff7eb3 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; margin-bottom: 0.8rem; font-size: 1.8rem; font-weight: 700; }
           p { line-height: 1.6; font-size: 0.95rem; margin-bottom: 1.5rem; }
-
-          /* 代码框内嵌发光效果 */
-          .code-box { 
-            background: rgba(255, 255, 255, 0.9); 
-            padding: 1rem; 
-            border-radius: 12px; 
-            border: 1px dashed #ffb6c1; 
-            font-family: 'Courier New', monospace; 
-            word-break: break-all; 
-            color: #ff0844; 
-            font-weight: bold; 
-            font-size: 0.9rem; 
-            box-shadow: inset 0 2px 5px rgba(0,0,0,0.03); 
-            transition: all 0.3s ease;
-          }
+          .code-box { background: rgba(255, 255, 255, 0.9); padding: 1rem; border-radius: 12px; border: 1px dashed #ffb6c1; font-family: 'Courier New', monospace; word-break: break-all; color: #ff0844; font-weight: bold; font-size: 0.9rem; box-shadow: inset 0 2px 5px rgba(0,0,0,0.03); transition: all 0.3s ease; }
           .code-box:hover { border-color: #ff758c; transform: scale(1.02); }
-
           .highlight { color: #ff7eb3; font-weight: bold; }
           .footer { margin-top: 2rem; font-size: 0.8rem; color: #a0aabf; font-weight: 600; letter-spacing: 1px;}
         </style>
@@ -195,8 +141,8 @@ async function handleSetup(origin, env) {
         <div class="blob-2"></div>
         <div class="glass-card">
           <div class="avatar">🐱</div>
-          <h1>🎉 籽青 V5.5.2 满血上线！</h1>
-          <p>性能已优化,多群组数据安全隔离应该正常！<br>Webhook 已经帮主人狠狠地绑死啦：</p>
+          <h1>🎉 籽青 V5.6.2 满血上线！</h1>
+          <p>无限回退、管理员回复魔法与花名册已就绪！<br>Webhook 已经帮主人狠狠地绑死啦：</p>
           <div class="code-box">${webhookUrl}</div>
           <p style="margin-top: 1.5rem;">快去 Telegram 里找 <span class="highlight">籽青</span> 玩耍吧！QwQ</p>
           <div class="footer">Powered by Cloudflare Workers & D1</div>
@@ -209,99 +155,26 @@ async function handleSetup(origin, env) {
   } catch (error) {
     console.error('部署失败喵:', error);
     
-    // 部署失败时的毛玻璃报错界面
     const errorHtml = `
       <!DOCTYPE html>
       <html lang="zh-CN">
       <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>籽青摔倒了喵！</title>
+        <title>摔倒了喵！</title>
         <style>
           @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;700&display=swap');
-          
-          body { 
-            font-family: 'Noto Sans SC', system-ui, sans-serif; 
-            display: flex; justify-content: center; align-items: center; 
-            min-height: 100vh; margin: 0; 
-            background: linear-gradient(135deg, #fdfbfb 0%, #ebedee 100%);
-            overflow: hidden;
-            color: #4a4a4a;
-          }
-          
-          /* 背景装饰圆块 - 报错红紫配色 */
+          body { font-family: 'Noto Sans SC', system-ui, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; background: linear-gradient(135deg, #fdfbfb 0%, #ebedee 100%); overflow: hidden; color: #4a4a4a; }
           .blob-1 { position: absolute; top: -10%; left: -10%; width: 400px; height: 400px; background: rgba(255, 99, 132, 0.3); border-radius: 50%; filter: blur(60px); z-index: 0; }
           .blob-2 { position: absolute; bottom: -10%; right: -10%; width: 350px; height: 350px; background: rgba(155, 89, 182, 0.3); border-radius: 50%; filter: blur(60px); z-index: 0; }
-
-          /* 毛玻璃主卡片 - 加入错误抖动动画 */
-          .glass-card { 
-            background: rgba(255, 255, 255, 0.7); 
-            backdrop-filter: blur(20px); 
-            -webkit-backdrop-filter: blur(20px); 
-            border: 1px solid rgba(255, 255, 255, 0.8); 
-            padding: 3rem 3rem 2.5rem; 
-            border-radius: 28px; 
-            box-shadow: 0 20px 40px rgba(255, 0, 0, 0.05), inset 0 0 0 1px rgba(255,255,255,0.5); 
-            text-align: center; 
-            max-width: 480px; 
-            width: 90%;
-            position: relative; 
-            z-index: 1;
-            animation: shake 0.6s cubic-bezier(.36,.07,.19,.97) both;
-          }
-
-          @keyframes shake {
-            10%, 90% { transform: translate3d(-1px, 0, 0); }
-            20%, 80% { transform: translate3d(2px, 0, 0); }
-            30%, 50%, 70% { transform: translate3d(-4px, 0, 0); }
-            40%, 60% { transform: translate3d(4px, 0, 0); }
-          }
-
-          /* 悬浮猫猫头像 - 哭泣 */
-          .avatar { 
-            font-size: 4.5rem; 
-            margin-top: -5.5rem; 
-            margin-bottom: 1rem; 
-            display: inline-block; 
-            background: white;
-            border-radius: 50%;
-            padding: 10px;
-            box-shadow: 0 10px 20px rgba(255, 99, 132, 0.2);
-            animation: float 3s infinite ease-in-out; 
-          }
-
-          @keyframes float { 
-            0%, 100% { transform: translateY(0); } 
-            50% { transform: translateY(-10px); } 
-          }
-
-          h1 { 
-            background: linear-gradient(135deg, #ff416c 0%, #ff4b2b 100%);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            margin-bottom: 0.8rem; 
-            font-size: 1.8rem; 
-            font-weight: 700; 
-          }
-
+          .glass-card { background: rgba(255, 255, 255, 0.7); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px); border: 1px solid rgba(255, 255, 255, 0.8); padding: 3rem 3rem 2.5rem; border-radius: 28px; box-shadow: 0 20px 40px rgba(255, 0, 0, 0.05), inset 0 0 0 1px rgba(255,255,255,0.5); text-align: center; max-width: 480px; width: 90%; position: relative; z-index: 1; animation: shake 0.6s cubic-bezier(.36,.07,.19,.97) both; }
+          @keyframes shake { 10%, 90% { transform: translate3d(-1px, 0, 0); } 20%, 80% { transform: translate3d(2px, 0, 0); } 30%, 50%, 70% { transform: translate3d(-4px, 0, 0); } 40%, 60% { transform: translate3d(4px, 0, 0); } }
+          .avatar { font-size: 4.5rem; margin-top: -5.5rem; margin-bottom: 1rem; display: inline-block; background: white; border-radius: 50%; padding: 10px; box-shadow: 0 10px 20px rgba(255, 99, 132, 0.2); animation: float 3s infinite ease-in-out; }
+          @keyframes float { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-10px); } }
+          h1 { background: linear-gradient(135deg, #ff416c 0%, #ff4b2b 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; margin-bottom: 0.8rem; font-size: 1.8rem; font-weight: 700; }
           p { line-height: 1.6; font-size: 0.95rem; margin-bottom: 1.5rem; }
-
-          /* 代码框内嵌发光效果 - 危险红 */
-          .code-box { 
-            background: rgba(255, 240, 245, 0.9); 
-            padding: 1rem; 
-            border-radius: 12px; 
-            border: 1px dashed #ff416c; 
-            font-family: 'Courier New', monospace; 
-            word-break: break-all; 
-            color: #d32f2f; 
-            font-weight: bold; 
-            font-size: 0.9rem; 
-            box-shadow: inset 0 2px 5px rgba(255,0,0,0.05); 
-            transition: all 0.3s ease;
-          }
+          .code-box { background: rgba(255, 240, 245, 0.9); padding: 1rem; border-radius: 12px; border: 1px dashed #ff416c; font-family: 'Courier New', monospace; word-break: break-all; color: #d32f2f; font-weight: bold; font-size: 0.9rem; box-shadow: inset 0 2px 5px rgba(255,0,0,0.05); transition: all 0.3s ease; }
           .code-box:hover { border-color: #ff4b2b; transform: scale(1.02); }
-
           .highlight { color: #ff4b2b; font-weight: bold; }
           .footer { margin-top: 2rem; font-size: 0.8rem; color: #a0aabf; font-weight: 600; letter-spacing: 1px;}
         </style>
@@ -311,7 +184,7 @@ async function handleSetup(origin, env) {
         <div class="blob-2"></div>
         <div class="glass-card">
           <div class="avatar">😿</div>
-          <h1>呜呜,籽青摔倒了喵...</h1>
+          <h1>呜呜,摔倒了喵...</h1>
           <p>部署过程中出现了一点小意外！<br>请主人检查一下 <span class="highlight">D1 数据库绑定</span> 或者 <span class="highlight">BOT_TOKEN</span> 哦：</p>
           <div class="code-box">${error.message}</div>
           <p style="margin-top: 1.5rem;">修好之后再刷新一下这个页面就可以啦！QwQ</p>
@@ -328,6 +201,15 @@ async function handleSetup(origin, env) {
  * 路由与消息处理
  * ========================================================================= */
 async function handleUpdate(update, env, ctx) {
+  // 🌟 记录花名册
+  const fromUser = update.message?.from || update.callback_query?.from;
+  if (fromUser) {
+    ctx.waitUntil(
+      env.D1.prepare(`INSERT INTO user_roster (user_id, first_name, last_name) VALUES (?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET first_name=excluded.first_name, last_name=excluded.last_name, updated_at=CURRENT_TIMESTAMP`)
+      .bind(fromUser.id, fromUser.first_name || '', fromUser.last_name || '').run().catch(() => {})
+    );
+  }
+
   if (update.message) {
     await handleMessage(update.message, env, ctx);
   } else if (update.callback_query) {
@@ -344,8 +226,8 @@ async function handleMessage(message, env, ctx) {
   if (text.startsWith('/start')) return sendMainMenu(chatId, topicId, env, userId);
 
   if (text.startsWith('/help')) {
-    const helpText = `📖 **籽青的说明书喵~ (≧∇≦)**\n/start - 唤出籽青的主菜单\n\n**【管理员专属指令喵】**\n/bind &lt;分类名&gt; - 将当前话题绑定为采集库\n/bind_output - 将当前话题设为专属推送展示窗口\n/import_json - 获取关于导入历史消息的说明`;
-    await tgAPI('sendMessage', { chat_id: chatId, message_thread_id: topicId, text: helpText, parse_mode: 'HTML' }, env);
+    const helpText = `📖 **籽青的说明书喵~ (≧∇≦)**\n/start - 唤出籽青的主菜单\n\n**【管理员专属指令喵】**\n/bind <分类名> - 将当前话题绑定为采集库\n/bind_output - 将当前话题设为专属推送展示窗口\n/import_json - 获取关于导入历史消息的说明\n\n**【快捷管理魔法】**\n直接回复某张图片/视频：\n发送 \`/del\` - 彻底抹除它\n发送 \`/move\` - 将它转移到其他分类`;
+    await tgAPI('sendMessage', { chat_id: chatId, message_thread_id: topicId, text: helpText, parse_mode: 'Markdown' }, env);
     return;
   }
 
@@ -353,6 +235,43 @@ async function handleMessage(message, env, ctx) {
     const importHelp = `📥 **关于导入历史数据喵**\n\n籽青有两种方法可以吃掉历史数据哦：\n\n1. **直接投喂 (适合 5MB 以内的小包裹)**：直接把 \`.json\` 文件发给籽青,并在文件的说明(Caption)里写上 \`/import 分类名\` 即可！\n2. **脚本投喂 (适合大包裹)**：在电脑上运行配套的 Python 导入脚本,慢慢喂给籽青！QwQ`;
     await tgAPI('sendMessage', { chat_id: chatId, message_thread_id: topicId, text: importHelp, parse_mode: 'Markdown' }, env);
     return;
+  }
+
+  // 🌟 快捷回复管理魔法 (/del 和 /move)
+  if (message.reply_to_message && (text.startsWith('/del') || text.startsWith('/move'))) {
+    if (!(await isAdmin(chatId, userId, env))) {
+      return tgAPI('sendMessage', { chat_id: chatId, message_thread_id: topicId, reply_to_message_id: message.message_id, text: "🚨 呜呜，只有管理员主人才可以使用回复魔法哦！" }, env);
+    }
+    
+    const info = extractMediaInfo(message.reply_to_message);
+    if (!info.fileUniqueId) {
+      return tgAPI('sendMessage', { chat_id: chatId, message_thread_id: topicId, reply_to_message_id: message.message_id, text: "喵？这似乎不是一个标准的图片或视频记录哦！" }, env);
+    }
+
+    const media = await env.D1.prepare(`SELECT id, category_name FROM media_library WHERE file_unique_id = ? AND chat_id = ? LIMIT 1`).bind(info.fileUniqueId, chatId).first();
+    if (!media) {
+      return tgAPI('sendMessage', { chat_id: chatId, message_thread_id: topicId, reply_to_message_id: message.message_id, text: "呜呜，籽青在数据库里找不到它的真身，可能早就被删除了喵~" }, env);
+    }
+
+    if (text.startsWith('/del')) {
+      await env.D1.prepare(`DELETE FROM media_library WHERE id = ?`).bind(media.id).run();
+      await env.D1.prepare(`DELETE FROM served_history WHERE media_id = ?`).bind(media.id).run();
+      await env.D1.prepare(`DELETE FROM user_favorites WHERE media_id = ?`).bind(media.id).run();
+      await env.D1.prepare(`DELETE FROM user_history WHERE media_id = ?`).bind(media.id).run();
+      await env.D1.prepare(`DELETE FROM group_history WHERE media_id = ?`).bind(media.id).run();
+      return tgAPI('sendMessage', { chat_id: chatId, message_thread_id: topicId, reply_to_message_id: message.reply_to_message.message_id, text: "🗑️ 抹除成功！这个媒体已经被籽青彻底销毁啦喵！" }, env);
+    } 
+    
+    if (text.startsWith('/move')) {
+      const { results } = await env.D1.prepare(`SELECT DISTINCT category_name FROM config_topics WHERE chat_id = ? AND category_name != 'output'`).bind(chatId).all();
+      if (!results || results.length === 0) {
+        return tgAPI('sendMessage', { chat_id: chatId, message_thread_id: topicId, text: "本群还没绑定其他分类呢喵~" }, env);
+      }
+      
+      const keyboard = results.map(r => [{ text: `🔀 转移至: ${r.category_name}`, callback_data: `mvcat_${media.id}|${r.category_name}` }]);
+      keyboard.push([{ text: "❌ 取消操作", callback_data: "cancel_action" }]);
+      return tgAPI('sendMessage', { chat_id: chatId, message_thread_id: topicId, reply_to_message_id: message.reply_to_message.message_id, text: `请选择要把这个记录转移到哪个分类喵：\n(当前分类: ${media.category_name})`, reply_markup: { inline_keyboard: keyboard } }, env);
+    }
   }
 
   if (text.startsWith('/bind ')) {
@@ -373,7 +292,7 @@ async function handleMessage(message, env, ctx) {
     return;
   }
 
-  // ==== 内置 JSON 直接解析功能 ====
+  // ==== 完整恢复的内置 JSON 解析功能 ====
   if (message.document && message.document.file_name && message.document.file_name.endsWith('.json') && text.startsWith('/import ')) {
     if (!(await isAdmin(chatId, userId, env))) {
       return tgAPI('sendMessage', { chat_id: chatId, message_thread_id: topicId, text: `🚨 呜呜,只有管理员主人才可以给籽青投喂文件哦！` }, env);
@@ -450,7 +369,7 @@ async function handleMessage(message, env, ctx) {
     return; 
   }
 
-  // ==== 日常媒体收录拦截 ====
+  // ==== 日常媒体收录拦截 (恢复 dup_notify 逻辑) ====
   let mediaInfo = extractMediaInfo(message);
   if (mediaInfo.fileUniqueId) {
     const query = await env.D1.prepare(`SELECT category_name FROM config_topics WHERE chat_id = ? AND (topic_id = ? OR topic_id IS NULL) AND category_name != 'output' LIMIT 1`).bind(chatId, topicId).first();
@@ -458,7 +377,9 @@ async function handleMessage(message, env, ctx) {
       const existing = await env.D1.prepare(`SELECT id FROM media_library WHERE file_unique_id = ? AND chat_id = ? LIMIT 1`).bind(mediaInfo.fileUniqueId, chatId).first();
       if (existing) {
         const notify = await getSetting(chatId, 'dup_notify', env);
-        if (notify === 'true') await tgAPI('sendMessage', { chat_id: chatId, message_thread_id: topicId, reply_to_message_id: message.message_id, text: "哎呀,籽青发现这个内容之前已经收录过啦喵~" }, env);
+        if (notify === 'true') {
+          await tgAPI('sendMessage', { chat_id: chatId, message_thread_id: topicId, reply_to_message_id: message.message_id, text: "哎呀,籽青发现这个内容之前已经收录过啦喵~" }, env);
+        }
         return; 
       }
       await env.D1.prepare(`INSERT INTO media_library (message_id, chat_id, topic_id, category_name, file_unique_id, file_id, media_type, caption) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
@@ -506,7 +427,15 @@ async function handleCallback(callback, env, ctx) {
   } else if (data === 'start_random') {
     await tgAPI('answerCallbackQuery', { callback_query_id: cbId }, env);
     await showCategories(chatId, msgId, env, userId);
-  } else if (data.startsWith('random_') || data.startsWith('next_')) {
+  } 
+
+  // 🌟 处理历史回退
+  else if (data.startsWith('prev_')) {
+    const params = data.replace('prev_', '').split('|');
+    await sendHistoricalMedia(userId, chatId, msgId, topicId, params[0], parseInt(params[1]), parseInt(params[2]), env, cbId);
+  }
+
+  else if (data.startsWith('random_') || data.startsWith('next_')) {
     const action = data.startsWith('random_') ? 'random_' : 'next_';
     const params = data.replace(action, '').split('|');
     const category = params[0];
@@ -514,6 +443,17 @@ async function handleCallback(callback, env, ctx) {
 
     await tgAPI('answerCallbackQuery', { callback_query_id: cbId, text: "籽青正在为你抽取喵..." }, env);
     await sendRandomMedia(userId, chatId, msgId, topicId, category, sourceChatId, action === 'next_', env, ctx, cbId);
+  }
+
+  // 🌟 分类转移指令处理
+  else if (data.startsWith('mvcat_')) {
+    if (!(await isAdmin(chatId, userId, env))) return;
+    const params = data.replace('mvcat_', '').split('|');
+    await env.D1.prepare(`UPDATE media_library SET category_name = ? WHERE id = ?`).bind(params[1], parseInt(params[0])).run();
+    await tgAPI('answerCallbackQuery', { callback_query_id: cbId, text: "空间转移成功喵！" }, env);
+    await tgAPI('editMessageText', { chat_id: chatId, message_id: msgId, text: `✅ 转移成功！该记录已安全转移到【${params[1]}】分类下喵~` }, env);
+  } else if (data === 'cancel_action') {
+    await tgAPI('deleteMessage', { chat_id: chatId, message_id: msgId }, env);
   }
 
   else if (data.startsWith('fav_add_')) {
@@ -529,6 +469,27 @@ async function handleCallback(callback, env, ctx) {
     await env.D1.prepare(`DELETE FROM user_favorites WHERE user_id = ? AND media_id = ?`).bind(userId, parseInt(data.replace('fav_del_', ''))).run();
     await tgAPI('answerCallbackQuery', { callback_query_id: cbId, text: "已从收藏夹移除喵！" }, env);
     await showFavoritesList(chatId, msgId, userId, 0, env);
+  }
+  
+  else if (data === 'history' || data.startsWith('hist_page_')) {
+    await tgAPI('answerCallbackQuery', { callback_query_id: cbId }, env);
+    const page = data === 'history' ? 0 : parseInt(data.replace('hist_page_', ''));
+    await showHistoryList(chatId, msgId, userId, page, env);
+  } else if (data.startsWith('hist_view_')) {
+    await tgAPI('answerCallbackQuery', { callback_query_id: cbId }, env);
+    await viewFavorite(chatId, topicId, parseInt(data.replace('hist_view_', '')), env);
+  } else if (data.startsWith('hist_del_')) {
+    const parts = data.replace('hist_del_', '').split('_'); 
+    const type = parts[0];
+    const recordId = parseInt(parts[1]);
+    
+    if (type === 'u') {
+      await env.D1.prepare(`DELETE FROM user_history WHERE id = ? AND user_id = ?`).bind(recordId, userId).run();
+    } else {
+      await env.D1.prepare(`DELETE FROM group_history WHERE id = ? AND chat_id = ?`).bind(recordId, chatId).run();
+    }
+    await tgAPI('answerCallbackQuery', { callback_query_id: cbId, text: "唰！足迹已经抹除啦喵！" }, env);
+    await showHistoryList(chatId, msgId, userId, 0, env);
   }
 
   else if (data === 'leaderboard' || data.startsWith('leader_page_')) {
@@ -553,6 +514,7 @@ async function handleCallback(callback, env, ctx) {
     else if (data === 'set_toggle_dup') await toggleSetting('dup_notify', env, chatId, msgId, ['true', 'false']);
     else if (data === 'set_toggle_success') await toggleSetting('show_success', env, chatId, msgId, ['true', 'false']);
     else if (data === 'set_toggle_nextmode') await toggleSetting('next_mode', env, chatId, msgId, ['replace', 'new']);
+    else if (data === 'set_toggle_strict') await toggleSetting('strict_skip', env, chatId, msgId, ['true', 'false']);
     else if (data === 'set_stats') await showStats(chatId, msgId, env);
     else if (data === 'set_unbind_list') await showUnbindList(chatId, msgId, env);
     else if (data.startsWith('set_unbind_do_')) {
@@ -573,6 +535,8 @@ async function handleCallback(callback, env, ctx) {
     } else if (data === 'set_clear_stats_do') {
       await env.D1.prepare(`UPDATE media_library SET view_count = 0 WHERE chat_id = ?`).bind(chatId).run();
       await env.D1.prepare(`DELETE FROM served_history WHERE media_id IN (SELECT id FROM media_library WHERE chat_id = ?)`).bind(chatId).run();
+      await env.D1.prepare(`DELETE FROM group_history WHERE chat_id = ?`).bind(chatId).run();
+      await env.D1.prepare(`DELETE FROM user_history WHERE chat_id = ?`).bind(chatId).run();
       await tgAPI('answerCallbackQuery', { callback_query_id: cbId, text: "当前群组统计重置完毕喵！", show_alert: true }, env);
       await showSettingsMain(chatId, msgId, env);
     }
@@ -584,6 +548,8 @@ async function handleCallback(callback, env, ctx) {
       await env.D1.prepare(`DELETE FROM user_favorites WHERE media_id IN (SELECT id FROM media_library WHERE chat_id = ?)`).bind(chatId).run();
       await env.D1.prepare(`DELETE FROM served_history WHERE media_id IN (SELECT id FROM media_library WHERE chat_id = ?)`).bind(chatId).run();
       await env.D1.prepare(`DELETE FROM media_library WHERE chat_id = ?`).bind(chatId).run();
+      await env.D1.prepare(`DELETE FROM group_history WHERE chat_id = ?`).bind(chatId).run();
+      await env.D1.prepare(`DELETE FROM user_history WHERE chat_id = ?`).bind(chatId).run();
       await tgAPI('answerCallbackQuery', { callback_query_id: cbId, text: "当前群组媒体库已被彻底清空喵！", show_alert: true }, env);
       await showSettingsMain(chatId, msgId, env);
     }
@@ -591,7 +557,7 @@ async function handleCallback(callback, env, ctx) {
 }
 
 /* =========================================================================
- * UI 流转逻辑 (包含身份鉴权)
+ * UI 流转逻辑
  * ========================================================================= */
 async function sendMainMenu(chatId, topicId, env, userId) {
   if (chatId > 0) {
@@ -616,7 +582,11 @@ async function editMainMenu(chatId, msgId, env, userId) {
 }
 
 function getMainMenuMarkup() {
-  return { inline_keyboard: [[{ text: "🎲 开始随机", callback_data: "start_random" }], [{ text: "🏆 本群排行", callback_data: "leaderboard" }, { text: "📁 收藏夹", callback_data: "favorites" }], [{ text: "⚙️ 籽青设置 (限管理)", callback_data: "set_main" }]] };
+  return { inline_keyboard: [
+    [{ text: "🎲 开始随机", callback_data: "start_random" }], 
+    [{ text: "🏆 本群排行", callback_data: "leaderboard" }, { text: "📁 收藏夹", callback_data: "favorites" }], 
+    [{ text: "📜 历史足迹", callback_data: "history" }, { text: "⚙️ 籽青设置 (限管理)", callback_data: "set_main" }]
+  ]};
 }
 
 async function showCategories(chatId, msgId, env, userId) {
@@ -640,14 +610,62 @@ async function showCategories(chatId, msgId, env, userId) {
     }
   }
 
-  if (keyboard.length === 0) return tgAPI('editMessageText', { chat_id: chatId, message_id: msgId, text: "呜呜,当前群组还没有绑定任何分类喵,管理员请使用 /bind 绑定哦！", reply_markup: getBackMarkup() }, env);
+  if (keyboard.length === 0) return tgAPI('editMessageText', { chat_id: chatId, message_id: msgId, text: "呜呜,当前群组还没有绑定任何分类喵，管理员请使用 /bind 绑定哦！", reply_markup: getBackMarkup() }, env);
 
   keyboard.push([{ text: "🏠 返回主菜单", callback_data: "main_menu" }]);
   const text = chatId < 0 ? "请选择您感兴趣的分类喵：" : "👇 以下是您所在群组的专属图库喵：";
   await tgAPI('editMessageText', { chat_id: chatId, message_id: msgId, text: text, reply_markup: { inline_keyboard: keyboard } }, env);
 }
 
-// ==== 核心抽取与展现逻辑 (融合 方案A: 失效自动清理 & 群组炸群连坐清理) ====
+// 🌟 历史回退媒体展现专属函数
+async function sendHistoricalMedia(userId, chatId, msgId, topicId, category, sourceChatId, offset, env, cbId) {
+  let outChatId = chatId; let outTopicId = topicId;
+  if (chatId < 0) {
+    const output = await env.D1.prepare(`SELECT chat_id, topic_id FROM config_topics WHERE category_name = 'output' AND chat_id = ? LIMIT 1`).bind(chatId).first();
+    if (output) { outChatId = output.chat_id; outTopicId = output.topic_id; }
+  }
+  
+  const settings = await getSettingsBatch(sourceChatId, ['display_mode', 'next_mode'], env);
+  const mode = settings.display_mode;
+  const nextMode = settings.next_mode || 'replace';
+
+  // 根据偏移量拉取用户历史
+  const media = await env.D1.prepare(`
+    SELECT m.* FROM user_history h 
+    JOIN media_library m ON h.media_id = m.id 
+    WHERE h.user_id = ? AND h.chat_id = ? AND m.category_name = ?
+    ORDER BY h.viewed_at DESC LIMIT 1 OFFSET ?
+  `).bind(userId, sourceChatId, category, offset).first();
+
+  if (!media) return tgAPI('answerCallbackQuery', { callback_query_id: cbId, text: "喵... 时空尽头啦，前面没有更多记录了哦！", show_alert: true }, env);
+  
+  await tgAPI('answerCallbackQuery', { callback_query_id: cbId, text: "时光倒流喵~ ⏪" }, env);
+
+  if (nextMode === 'replace') {
+    try { await tgAPI('deleteMessage', { chat_id: outChatId, message_id: msgId }, env); } catch(e){}
+  }
+
+  // 拼接回退控制键盘
+  const actionKeyboard = [
+    [ { text: "⏪ 继退", callback_data: `prev_${category}|${sourceChatId}|${offset + 1}` }, { text: "⏭️ 换新", callback_data: `next_${category}|${sourceChatId}` } ],
+    [ { text: "❤️ 收藏", callback_data: `fav_add_${media.id}` } ]
+  ];
+
+  if (mode === 'A') {
+    const res = await tgAPI('forwardMessage', { chat_id: outChatId, message_thread_id: outTopicId, from_chat_id: media.chat_id, message_id: media.message_id }, env);
+    const data = await res.json();
+    if(data.ok) {
+      actionKeyboard.push([{ text: "🏠 呼出主菜单", callback_data: "main_menu_new" }]);
+      await tgAPI('sendMessage', { chat_id: outChatId, message_thread_id: outTopicId, reply_to_message_id: data.result.message_id, text: "👆 (历史回忆) 可以点这里操作喵：", reply_markup: { inline_keyboard: actionKeyboard } }, env);
+    }
+  } else {
+    actionKeyboard.unshift([{ text: "🔗 去原记录围观", url: makeDeepLink(media.chat_id, media.message_id) }]);
+    actionKeyboard.push([{ text: "🏠 呼出主菜单", callback_data: "main_menu_new" }]);
+    await tgAPI('copyMessage', { chat_id: outChatId, message_thread_id: outTopicId, from_chat_id: media.chat_id, message_id: media.message_id, reply_markup: { inline_keyboard: actionKeyboard } }, env);
+  }
+}
+
+// ==== 核心抽取与展现逻辑 ====
 async function sendRandomMedia(userId, chatId, msgId, topicId, category, sourceChatId, isNext, env, ctx, cbId) {
   if (chatId > 0) {
     const inGroup = await isUserInGroup(sourceChatId, userId, env);
@@ -667,28 +685,39 @@ async function sendRandomMedia(userId, chatId, msgId, topicId, category, sourceC
     outTopicId = output.topic_id;
   }
 
-  // P1: 批量读取所有设置,1次 D1 查询替代 5次
-  const settings = await getSettingsBatch(sourceChatId, ['display_mode', 'anti_repeat', 'auto_jump', 'show_success', 'next_mode'], env);
+  // P1: 批量读取所有设置
+  const settings = await getSettingsBatch(sourceChatId, ['display_mode', 'anti_repeat', 'auto_jump', 'show_success', 'next_mode', 'strict_skip'], env);
   const mode = settings.display_mode;
   const useAntiRepeat = settings.anti_repeat === 'true';
   const autoJump = settings.auto_jump === 'true';
   const showSuccess = settings.show_success === 'true';
   const nextMode = settings.next_mode || 'replace';
+  const strictSkip = settings.strict_skip === 'true'; 
   const now = Date.now();
 
-  // 连点防刷退回逻辑
+  let excludeMediaId = null;
+
+  // 连点防刷退回逻辑 & 提取排除 ID
   if (isNext) {
     const last = await env.D1.prepare(`SELECT * FROM last_served WHERE user_id = ?`).bind(userId).first();
-    if (last && (now - last.served_at) < 30000) {
-      // P3: 非关键写入异步化
-      ctx.waitUntil(Promise.all([
-        env.D1.prepare(`UPDATE media_library SET view_count = MAX(0, view_count - 1) WHERE id = ?`).bind(last.last_media_id).run(),
-        useAntiRepeat ? env.D1.prepare(`DELETE FROM served_history WHERE media_id = ?`).bind(last.last_media_id).run() : Promise.resolve()
-      ]));
+    if (last) {
+      excludeMediaId = last.last_media_id; 
+      
+      if ((now - last.served_at) < 30000) {
+        if (strictSkip) {
+          ctx.waitUntil(
+            env.D1.prepare(`UPDATE media_library SET view_count = MAX(0, view_count - 1) WHERE id = ?`).bind(excludeMediaId).run()
+          );
+        } else {
+          ctx.waitUntil(Promise.all([
+            env.D1.prepare(`UPDATE media_library SET view_count = MAX(0, view_count - 1) WHERE id = ?`).bind(excludeMediaId).run(),
+            useAntiRepeat ? env.D1.prepare(`DELETE FROM served_history WHERE media_id = ?`).bind(excludeMediaId).run() : Promise.resolve()
+          ]));
+        }
+      }
     }
   }
 
-  // 🌟 方案 A 自动重试与体检循环 (最多重试 3 次,防止 CF Worker 超时)
   let attempts = 0;
   let foundValid = false;
   let media = null;
@@ -697,16 +726,14 @@ async function sendRandomMedia(userId, chatId, msgId, topicId, category, sourceC
   while (attempts < 3 && !foundValid) {
     attempts++;
 
-    // 1. P1: id-pivot 随机策略替代 ORDER BY RANDOM() 全表扫描
-    media = await selectRandomMedia(category, sourceChatId, useAntiRepeat, env);
+    media = await selectRandomMedia(category, sourceChatId, useAntiRepeat, excludeMediaId, env);
 
-    // 如果防重库空了,重置防重库再捞一次
     if (!media && useAntiRepeat) {
       const totalCheck = await env.D1.prepare(`SELECT count(*) as c FROM media_library WHERE category_name = ? AND chat_id = ?`).bind(category, sourceChatId).first();
       if (totalCheck && totalCheck.c > 0) {
         await env.D1.prepare(`DELETE FROM served_history WHERE media_id IN (SELECT id FROM media_library WHERE category_name = ? AND chat_id = ?)`).bind(category, sourceChatId).run();
         await tgAPI('sendMessage', { chat_id: outChatId, message_thread_id: outTopicId, text: `🎉 哇哦,【${category}】的内容全看光了！籽青已重置防重库喵~` }, env);
-        media = await selectRandomMedia(category, sourceChatId, false, env);
+        media = await selectRandomMedia(category, sourceChatId, false, excludeMediaId, env);
       }
     }
 
@@ -715,13 +742,16 @@ async function sendRandomMedia(userId, chatId, msgId, topicId, category, sourceC
       return;
     }
 
-    // 2. 原地替换：尝试删除上一次的旧消息卡片
     if (isNext && nextMode === 'replace' && attempts === 1) {
       try { await tgAPI('deleteMessage', { chat_id: outChatId, message_id: msgId }, env); } catch (e) {}
     }
 
-    // 3. 尝试发送给用户 (探活核心)
-    const actionKeyboard = [[{ text: "⏭️ 换一个喵", callback_data: `next_${category}|${sourceChatId}` }, { text: "❤️ 收藏", callback_data: `fav_add_${media.id}` }]];
+    // 🌟 双排控制按钮 (带上 ⏪ 上一个)
+    const actionKeyboard = [
+      [ { text: "⏪ 上一个", callback_data: `prev_${category}|${sourceChatId}|1` }, { text: "⏭️ 换一个喵", callback_data: `next_${category}|${sourceChatId}` } ],
+      [ { text: "❤️ 收藏", callback_data: `fav_add_${media.id}` } ]
+    ];
+
     const originalDeepLink = makeDeepLink(media.chat_id, media.message_id);
 
     let res, data;
@@ -741,7 +771,6 @@ async function sendRandomMedia(userId, chatId, msgId, topicId, category, sourceC
       if(data.ok) newSentMessageId = data.result.message_id;
     }
 
-    // 4. 分析探活结果
     if (data.ok) {
       foundValid = true;
     } else {
@@ -757,19 +786,19 @@ async function sendRandomMedia(userId, chatId, msgId, topicId, category, sourceC
     }
   }
 
-  // ==== 循环结束后的收尾工作 ====
   if (!foundValid) {
     return tgAPI('sendMessage', { chat_id: chatId, message_thread_id: topicId, text: "🧹 呼... 连续抽到好多失效图片,籽青已经把坏数据打扫干净啦,请主人再点一次重抽喵！" }, env);
   }
 
-  // P3: 统计写入全部异步化,不阻塞响应
   ctx.waitUntil(Promise.all([
     useAntiRepeat ? env.D1.prepare(`INSERT OR IGNORE INTO served_history (media_id) VALUES (?)`).bind(media.id).run() : Promise.resolve(),
     env.D1.prepare(`INSERT INTO last_served (user_id, last_media_id, served_at) VALUES (?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET last_media_id=excluded.last_media_id, served_at=excluded.served_at`).bind(userId, media.id, now).run(),
-    env.D1.prepare(`UPDATE media_library SET view_count = view_count + 1 WHERE id = ?`).bind(media.id).run()
+    env.D1.prepare(`UPDATE media_library SET view_count = view_count + 1 WHERE id = ?`).bind(media.id).run(),
+    env.D1.prepare(`INSERT INTO user_history (user_id, chat_id, media_id) VALUES (?, ?, ?)`).bind(userId, sourceChatId, media.id).run(),
+    env.D1.prepare(`INSERT INTO group_history (chat_id, media_id) VALUES (?, ?)`).bind(sourceChatId, media.id).run()
   ]));
 
-  // 成功抽取的反馈提示
+  // 🌟 完全恢复 auto_jump 跳转功能！
   if (!isNext && chatId < 0) {
     if (showSuccess) {
       const jumpToOutputLink = newSentMessageId ? makeDeepLink(outChatId, newSentMessageId) : null;
@@ -783,44 +812,37 @@ async function sendRandomMedia(userId, chatId, msgId, topicId, category, sourceC
   }
 }
 
+// 🌟 带有防崩溃 HTML 转义的排行榜
 async function showLeaderboard(chatId, msgId, page, env) {
-  const limit = 5;
-  const offset = page * limit;
-  if (chatId > 0) return tgAPI('editMessageText', { chat_id: chatId, message_id: msgId, text: "喵,私聊模式暂不支持查看群排行哦,请在群组内使用 QwQ", reply_markup: getBackMarkup() }, env);
-
+  if (chatId > 0) return tgAPI('editMessageText', { chat_id: chatId, message_id: msgId, text: "喵,私聊模式暂不支持查看群排行哦", reply_markup: getBackMarkup() }, env);
+  const limit = 5, offset = page * limit;
   const [leaderData, totalRes] = await Promise.all([
     env.D1.prepare(`SELECT chat_id, message_id, category_name, view_count, caption FROM media_library WHERE view_count > 0 AND chat_id = ? ORDER BY view_count DESC LIMIT ? OFFSET ?`).bind(chatId, limit, offset).all(),
     env.D1.prepare(`SELECT count(*) as c FROM media_library WHERE view_count > 0 AND chat_id = ?`).bind(chatId).first()
   ]);
-  const results = leaderData.results;
   
-  let text = "🏆 **本群浏览量排行榜喵**\n\n";
-  if (!results || results.length === 0) {
+  const escapeHTML = (str) => String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+  let text = "🏆 <b>本群浏览量排行榜喵</b>\n\n";
+  if (!leaderData.results || leaderData.results.length === 0) {
     text += "当前群组还没有产生播放数据呢~";
   } else {
-    results.forEach((row, idx) => { 
-      const preview = row.caption ? row.caption.substring(0, 15) + '...' : '媒体记录';
-      text += `${offset + idx + 1}. [${row.category_name}] <a href="${makeDeepLink(row.chat_id, row.message_id)}">${preview}</a> - 浏览: ${row.view_count}\n`; 
+    leaderData.results.forEach((row, idx) => { 
+      const safeCaption = escapeHTML(row.caption ? row.caption.substring(0, 15) : '记录');
+      text += `${offset + idx + 1}. [${escapeHTML(row.category_name)}] <a href="${makeDeepLink(row.chat_id, row.message_id)}">${safeCaption}</a> - 浏览: ${row.view_count}\n`; 
     });
   }
 
-  const keyboard = [];
-  const navRow = [];
+  const keyboard = []; const navRow = [];
   if (page > 0) navRow.push({ text: "⬅️ 上一页", callback_data: `leader_page_${page - 1}` });
   if (offset + limit < totalRes.c) navRow.push({ text: "下一页 ➡️", callback_data: `leader_page_${page + 1}` });
   if (navRow.length > 0) keyboard.push(navRow);
   keyboard.push([{ text: "🏠 返回主菜单", callback_data: "main_menu" }]);
-
   await tgAPI('editMessageText', { chat_id: chatId, message_id: msgId, text, parse_mode: 'HTML', disable_web_page_preview: true, reply_markup: { inline_keyboard: keyboard } }, env);
 }
 
 async function handleAddFavorite(userId, cbId, mediaId, env) {
-  try { 
-    await env.D1.prepare(`INSERT INTO user_favorites (user_id, media_id) VALUES (?, ?)`).bind(userId, mediaId).run(); 
-    await tgAPI('answerCallbackQuery', { callback_query_id: cbId, text: "收藏成功喵！籽青帮你记下来啦~ ❤️", show_alert: true }, env); 
-  } catch (e) { 
-    await tgAPI('answerCallbackQuery', { callback_query_id: cbId, text: "喵？你已经收藏过这个啦~", show_alert: true }, env); 
-  }
+  try { await env.D1.prepare(`INSERT INTO user_favorites (user_id, media_id) VALUES (?, ?)`).bind(userId, mediaId).run(); await tgAPI('answerCallbackQuery', { callback_query_id: cbId, text: "收藏成功喵！籽青帮你记下来啦~ ❤️", show_alert: true }, env); } catch (e) { await tgAPI('answerCallbackQuery', { callback_query_id: cbId, text: "喵？你已经收藏过这个啦~", show_alert: true }, env); }
 }
 
 async function showFavoritesList(chatId, msgId, userId, page, env) {
@@ -849,44 +871,78 @@ async function showFavoritesList(chatId, msgId, userId, page, env) {
   await tgAPI('editMessageText', { chat_id: chatId, message_id: msgId, text: `📁 **主人的私有收藏夹** (共 ${totalRes.c} 条)`, parse_mode: 'Markdown', reply_markup: { inline_keyboard: keyboard } }, env);
 }
 
+async function showHistoryList(chatId, msgId, userId, page, env) {
+  const limit = 5, offset = page * limit; let results, totalRes, title;
+  
+  if (chatId > 0) { 
+    results = (await env.D1.prepare(`SELECT h.id as hist_id, m.id as media_id, m.media_type, m.caption FROM user_history h LEFT JOIN media_library m ON h.media_id = m.id WHERE h.user_id = ? ORDER BY h.viewed_at DESC LIMIT ? OFFSET ?`).bind(userId, limit, offset).all()).results;
+    totalRes = await env.D1.prepare(`SELECT count(*) as c FROM user_history WHERE user_id = ?`).bind(userId).first();
+    title = "🐾 主人的全局历史足迹";
+  } else { 
+    results = (await env.D1.prepare(`SELECT h.id as hist_id, m.id as media_id, m.media_type, m.caption FROM group_history h LEFT JOIN media_library m ON h.media_id = m.id WHERE h.chat_id = ? ORDER BY h.viewed_at DESC LIMIT ? OFFSET ?`).bind(chatId, limit, offset).all()).results;
+    totalRes = await env.D1.prepare(`SELECT count(*) as c FROM group_history WHERE chat_id = ?`).bind(chatId).first();
+    title = "🐾 本群的历史足迹";
+  }
+  
+  if (!results || results.length === 0) return tgAPI('editMessageText', { chat_id: chatId, message_id: msgId, text: "这里干干净净的，还没有留下任何足迹喵~", reply_markup: getBackMarkup() }, env);
+  
+  const keyboard = results.map((r) => {
+    const typeIcon = r.media_type === 'video' ? '🎬' : (r.media_type === 'photo' ? '🖼️' : '📁');
+    const caption = r.caption ? r.caption.substring(0, 15) : '已看记录';
+    const typePrefix = chatId > 0 ? 'u' : 'g'; 
+    return [
+      { text: `${typeIcon} ${caption}`, callback_data: `hist_view_${r.media_id}` }, 
+      { text: `❌ 抹除`, callback_data: `hist_del_${typePrefix}_${r.hist_id}` }
+    ];
+  });
+
+  const navRow = [];
+  if (page > 0) navRow.push({ text: "⬅️ 上一页", callback_data: `hist_page_${page - 1}` });
+  if (offset + limit < totalRes.c) navRow.push({ text: "下一页 ➡️", callback_data: `hist_page_${page + 1}` });
+  if (navRow.length > 0) keyboard.push(navRow);
+  keyboard.push([{ text: "🏠 返回主菜单", callback_data: "main_menu" }]);
+  
+  await tgAPI('editMessageText', { chat_id: chatId, message_id: msgId, text: `${title} (共 ${totalRes.c} 条)`, parse_mode: 'Markdown', reply_markup: { inline_keyboard: keyboard } }, env);
+}
+
+
 async function viewFavorite(chatId, topicId, mediaId, env) {
   const media = await env.D1.prepare(`SELECT * FROM media_library WHERE id = ?`).bind(mediaId).first();
   if (media) await tgAPI('copyMessage', { chat_id: chatId, message_thread_id: topicId, from_chat_id: media.chat_id, message_id: media.message_id }, env);
 }
 
-// ==== V5.5 专属设置看板 (基于 chat_id 获取独立配置) ====
+// ==== V5.5 专属设置看板 ====
 async function showSettingsMain(chatId, msgId, env) {
-  // P1: 批量读取所有设置,1次 D1 查询替代 6次
-  const settings = await getSettingsBatch(chatId, ['display_mode', 'anti_repeat', 'auto_jump', 'dup_notify', 'show_success', 'next_mode'], env);
+  const settings = await getSettingsBatch(chatId, ['display_mode', 'anti_repeat', 'auto_jump', 'dup_notify', 'show_success', 'next_mode', 'strict_skip'], env);
   const mode = settings.display_mode;
   const repeat = settings.anti_repeat;
   const jump = settings.auto_jump;
   const dup = settings.dup_notify;
   const showSuccess = settings.show_success;
   const nextMode = settings.next_mode;
+  const strictSkip = settings.strict_skip;
   
   const text = "⚙️ **本群的独立控制面板喵**\n\n请主人调整下方的功能开关：";
   const keyboard = [
     [{ text: `🔀 展现形式: ${mode === 'A' ? 'A(原生转发)' : 'B(复制+链接)'}`, callback_data: "set_toggle_mode" }],
     [{ text: `🔁 防重库机制: ${repeat === 'true' ? '✅ 已开启' : '❌ 未开启'}`, callback_data: "set_toggle_repeat" }],
+    [{ text: `⏱️ 快划跳过模式: ${strictSkip === 'true' ? '🔥 严格消耗(强制防重)' : '♻️ 稍后再看(正常防重)'}`, callback_data: "set_toggle_strict" }], 
     [{ text: `🔕 重复收录提示: ${dup === 'true' ? '📢 消息提醒' : '🔇 静默拦截'}`, callback_data: "set_toggle_dup" }],
     [{ text: `🔄 '换一个'模式: ${nextMode === 'replace' ? '🖼️ 原地替换(删旧发新)' : '💬 发新消息(保留历史)'}`, callback_data: "set_toggle_nextmode" }],
     [{ text: `🔔 抽取成功提示: ${showSuccess === 'true' ? '✅ 开启' : '❌ 关闭'}`, callback_data: "set_toggle_success" }],
     [{ text: `🚀 抽取后生成跳转: ${jump === 'true' ? '✅ 开启' : '❌ 关闭'}`, callback_data: "set_toggle_jump" }],
-    [{ text: "🗑️ 管理本群解绑", callback_data: "set_unbind_list" }, { text: "📊 本群数据看板", callback_data: "set_stats" }],
+    [{ text: "🗑️ 管理本群解绑", callback_data: "set_unbind_list" }, { text: "📊 本群超级数据看板", callback_data: "set_stats" }],
     [{ text: "⚠️ 危险操作区 (清空本群数据)", callback_data: "set_danger_zone" }],
     [{ text: "🏠 返回主菜单", callback_data: "main_menu" }]
   ];
   await tgAPI('editMessageText', { chat_id: chatId, message_id: msgId, text, parse_mode: 'Markdown', reply_markup: { inline_keyboard: keyboard } }, env);
 }
 
-// ==== V5.5 更新：保存独立配置 ====
 async function toggleSetting(key, env, chatId, msgId, values) {
   const current = await getSetting(chatId, key, env);
   const valCurrent = current === null ? values[0] : current;
   const next = valCurrent === values[0] ? values[1] : values[0];
   
-  // 插入带有 chat_id 的设置,遇到冲突就更新 value
   await env.D1.prepare(`INSERT INTO chat_settings (chat_id, key, value) VALUES (?, ?, ?) ON CONFLICT(chat_id, key) DO UPDATE SET value=excluded.value`).bind(chatId, key, next).run();
   
   await showSettingsMain(chatId, msgId, env);
@@ -900,15 +956,73 @@ async function showUnbindList(chatId, msgId, env) {
   await tgAPI('editMessageText', { chat_id: chatId, message_id: msgId, text: "点击对应按钮解除本群的话题绑定喵：", reply_markup: { inline_keyboard: keyboard } }, env);
 }
 
+// 🌟 究极防弹版：增强版全知数据看板 (自带时间戳刷新与全类型安全转换)
 async function showStats(chatId, msgId, env) {
-  const [mediaRes, topicRes] = await Promise.all([
-    env.D1.prepare(`SELECT count(*) as c FROM media_library WHERE chat_id = ?`).bind(chatId).first(),
-    env.D1.prepare(`SELECT count(*) as c FROM config_topics WHERE chat_id = ?`).bind(chatId).first()
-  ]);
-  const mediaCount = mediaRes?.c || 0;
-  const topicCount = topicRes?.c || 0;
-  const text = `📊 **本群数据看板喵**\n\n- 本群收录媒体: **${mediaCount}** 条\n- 本群绑定话题: **${topicCount}** 个`;
-  await tgAPI('editMessageText', { chat_id: chatId, message_id: msgId, text, parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{text: "⬅️ 返回设置", callback_data: "set_main"}]] } }, env);
+  try {
+    const [mediaRes, topicRes, viewRes, catRes, userRes, antiRes, recentAntiRes] = await Promise.all([
+      env.D1.prepare(`SELECT count(*) as c FROM media_library WHERE chat_id = ?`).bind(chatId).first(),
+      env.D1.prepare(`SELECT count(*) as c FROM config_topics WHERE chat_id = ?`).bind(chatId).first(),
+      env.D1.prepare(`SELECT sum(view_count) as v FROM media_library WHERE chat_id = ?`).bind(chatId).first(),
+      env.D1.prepare(`SELECT category_name, count(*) as c FROM media_library WHERE chat_id = ? GROUP BY category_name`).bind(chatId).all(),
+      // 这里的表名已经彻底确认为 user_history
+      env.D1.prepare(`SELECT u.user_id, r.first_name, count(*) as c FROM user_history u LEFT JOIN user_roster r ON u.user_id = r.user_id WHERE u.chat_id = ? GROUP BY u.user_id ORDER BY c DESC LIMIT 3`).bind(chatId).all(),
+      env.D1.prepare(`SELECT count(*) as c FROM served_history sh JOIN media_library m ON sh.media_id = m.id WHERE m.chat_id = ?`).bind(chatId).first(),
+      env.D1.prepare(`SELECT m.caption, m.media_type FROM served_history sh JOIN media_library m ON sh.media_id = m.id WHERE m.chat_id = ? ORDER BY sh.media_id DESC LIMIT 5`).bind(chatId).all()
+    ]);
+
+    // 究极安全的 HTML 转义工具，防止 null 或纯数字搞崩系统
+    const escapeHTML = (str) => {
+      if (str === null || str === undefined) return '';
+      return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    };
+
+    let text = `📊 <b>本群超级数据看板喵</b>\n\n`;
+    text += `📦 <b>总收录</b>: ${mediaRes?.c || 0} 条\n`;
+    text += `👀 <b>总浏览</b>: ${viewRes?.v || 0} 次\n`;
+    text += `🛡️ <b>防重库</b>: 拦截了 ${antiRes?.c || 0} 条\n\n`;
+    
+    text += `📂 <b>分类统计</b>:\n`;
+    if (catRes.results && catRes.results.length > 0) {
+      catRes.results.forEach(r => text += `- ${escapeHTML(r.category_name)}: ${r.c} 条\n`);
+    } else {
+      text += `- 暂无分类\n`;
+    }
+    
+    text += `\n🔥 <b>群内最活跃大佬 (Top 3)</b>:\n`;
+    if (userRes.results && userRes.results.length > 0) {
+      userRes.results.forEach((r, idx) => { 
+        const safeName = escapeHTML(r.first_name || `神秘人(${r.user_id})`);
+        text += `${idx+1}. <a href="tg://user?id=${r.user_id}">${safeName}</a> (抽图 ${r.c} 次)\n`; 
+      });
+    } else {
+      text += `- 暂无数据\n`;
+    }
+    
+    text += `\n🛡️ <b>最近被打入冷宫的记录</b>:\n`;
+    if (recentAntiRes.results && recentAntiRes.results.length > 0) {
+      recentAntiRes.results.forEach(r => { 
+        // 强制转换为字符串，防止纯数字配文导致 substring 报错
+        const capStr = String(r.caption || '');
+        const safeCaption = escapeHTML(capStr ? capStr.substring(0, 10) : '无配文');
+        text += `- ${r.media_type === 'video' ? '🎬' : '🖼️'} ${safeCaption}\n`; 
+      });
+    } else {
+      text += `- 防重库为空喵\n`;
+    }
+
+    // 🌟 杀手锏：强制加入微秒级时间戳！
+    // 这样保证每次点击时，发给 Telegram 的文字都是 100% 不同的，彻底解决 message is not modified 不刷新的问题！
+    const timeStr = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
+    text += `\n<i>(数据更新于: ${timeStr})</i>`;
+
+    await tgAPI('editMessageText', { chat_id: chatId, message_id: msgId, text, parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{text: "⬅️ 返回设置", callback_data: "set_main"}]] } }, env);
+  } catch (e) {
+    console.error("看板报错:", e.message);
+    // 同样给报错信息套上防弹转义，确诊连 Telegram 都不敢吞报错
+    const errStr = String(e.message || '未知错误').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const errText = `🚨 <b>面板崩溃啦！</b>\n\n详细报错信息：\n<code>${errStr}</code>`;
+    await tgAPI('editMessageText', { chat_id: chatId, message_id: msgId, text: errText, parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{text: "⬅️ 返回设置", callback_data: "set_main"}]] } }, env);
+  }
 }
 
 function getBackMarkup() {
@@ -935,28 +1049,25 @@ function getWebAppHTML() {
           --tg-theme-button-text-color: #ffffff;
           --tg-theme-secondary-bg-color: #e5e7eb;
         }
-        body {
-          font-family: system-ui, -apple-system, sans-serif;
-          background-color: var(--tg-theme-bg-color);
-          color: var(--tg-theme-text-color);
-          margin: 0; padding: 0; padding-bottom: 70px;
-          transition: background-color 0.3s, color 0.3s;
-        }
+        body { font-family: system-ui, -apple-system, sans-serif; background-color: var(--tg-theme-bg-color); color: var(--tg-theme-text-color); margin: 0; padding: 0; padding-bottom: 70px; transition: background-color 0.3s, color 0.3s; }
         .header { padding: 20px; background: linear-gradient(135deg, #ff758c 0%, #ff7eb3 100%); color: white; border-bottom-left-radius: 20px; border-bottom-right-radius: 20px; box-shadow: 0 4px 15px rgba(255, 117, 140, 0.3); }
         .header h1 { margin: 0; font-size: 24px; font-weight: bold; }
         .header p { margin: 5px 0 0; opacity: 0.9; font-size: 14px; }
-        
         .tab-content { display: none; padding: 20px; animation: fadeIn 0.3s ease; }
         .tab-content.active { display: block; }
         @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
-        
         .card { background-color: var(--tg-theme-secondary-bg-color); border-radius: 16px; padding: 16px; margin-bottom: 16px; box-shadow: 0 2px 10px rgba(0,0,0,0.05); }
         .card h3 { margin-top: 0; margin-bottom: 10px; font-size: 16px; display: flex; align-items: center; gap: 8px;}
-        
         .bottom-nav { position: fixed; bottom: 0; left: 0; right: 0; height: 65px; background-color: var(--tg-theme-secondary-bg-color); display: flex; justify-content: space-around; align-items: center; border-top-left-radius: 20px; border-top-right-radius: 20px; box-shadow: 0 -2px 15px rgba(0,0,0,0.05); z-index: 1000;}
-        .nav-item { display: flex; flex-direction: column; align-items: center; justify-content: center; width: 33%; height: 100%; color: var(--tg-theme-text-color); opacity: 0.6; text-decoration: none; font-size: 12px; font-weight: bold; transition: all 0.2s; }
+        .nav-item { display: flex; flex-direction: column; align-items: center; justify-content: center; width: 25%; height: 100%; color: var(--tg-theme-text-color); opacity: 0.6; text-decoration: none; font-size: 12px; font-weight: bold; transition: all 0.2s; }
         .nav-item.active { opacity: 1; color: var(--tg-theme-button-color); transform: translateY(-2px); }
         .nav-icon { font-size: 24px; margin-bottom: 4px; }
+        .gallery-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; margin-top: 15px; }
+        .gallery-item { background: var(--tg-theme-bg-color); border-radius: 12px; padding: 12px; text-align: center; box-shadow: 0 2px 5px rgba(0,0,0,0.05); }
+        .gallery-icon { font-size: 28px; margin-bottom: 8px; }
+        .gallery-title { font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-bottom: 10px; font-weight: bold;}
+        .gallery-btn { background: var(--tg-theme-button-color); color: var(--tg-theme-button-text-color); border: none; border-radius: 8px; padding: 6px 0; font-size: 12px; cursor: pointer; width: 100%; font-weight: bold;}
+        .top-user-li { display: flex; justify-content: space-between; margin-bottom: 8px; border-bottom: 1px dashed rgba(0,0,0,0.1); padding-bottom: 4px; }
       </style>
     </head>
     <body>
@@ -967,20 +1078,26 @@ function getWebAppHTML() {
 
       <div id="tab-dashboard" class="tab-content active">
         <div class="card">
-          <h3>📊 全局数据总览</h3>
-          <p>这里以后会画漂亮的柱状图和饼图喵！</p>
+          <h3>📊 全局核心数据</h3>
           <div style="display:flex; justify-content: space-between; margin-top: 15px;">
-            <div style="text-align:center;"><b>???</b><br><small>总收录</small></div>
-            <div style="text-align:center;"><b>???</b><br><small>总浏览</small></div>
-            <div style="text-align:center;"><b>???</b><br><small>群组数</small></div>
+            <div style="text-align:center;"><b id="stat-media" style="font-size: 18px;">--</b><br><small>收录</small></div>
+            <div style="text-align:center;"><b id="stat-views" style="font-size: 18px;">--</b><br><small>浏览</small></div>
+            <div style="text-align:center;"><b id="stat-anti" style="font-size: 18px;">--</b><br><small>防重拦截</small></div>
+            <div style="text-align:center;"><b id="stat-groups" style="font-size: 18px;">--</b><br><small>群组</small></div>
           </div>
+        </div>
+        <div class="card">
+          <h3>🏆 全局最高活跃排名</h3>
+          <ul id="top-users-list" style="margin: 0; padding-left: 0; font-size: 13px; list-style: none;">
+            <li>正在拉取排行喵...</li>
+          </ul>
         </div>
       </div>
 
       <div id="tab-settings" class="tab-content">
         <div class="card">
           <h3>⚙️ 高级配置</h3>
-          <p>可视化的开关正在紧锣密鼓地施工中喵！以后点这里的按钮就能直接改数据库啦！</p>
+          <p>施工中喵！</p>
           <button style="width: 100%; padding: 12px; border: none; border-radius: 10px; background: var(--tg-theme-button-color); color: var(--tg-theme-button-text-color); font-weight: bold;">测试按钮 (暂无功能)</button>
         </div>
       </div>
@@ -988,10 +1105,21 @@ function getWebAppHTML() {
       <div id="tab-gallery" class="tab-content">
         <div class="card">
           <h3>🖼️ 我的私人画廊</h3>
-          <p>瀑布流照片墙施工中... 敬请期待！(๑•̀ㅂ•́)و✧</p>
+          <div id="gallery-container" class="gallery-grid">
+            <p style="grid-column: span 2; text-align: center; font-size: 13px; opacity: 0.6;">正在向籽青请求数据喵...</p>
+          </div>
         </div>
       </div>
-
+      
+       <div id="tab-history" class="tab-content">
+        <div class="card">
+          <h3>📜 我的全局足迹</h3>
+          <div id="history-container" class="gallery-grid">
+            <p style="grid-column: span 2; text-align: center; font-size: 13px; opacity: 0.6;">正在向籽青请求数据喵...</p>
+          </div>
+        </div>
+      </div>
+      
       <div class="bottom-nav">
         <div class="nav-item active" onclick="switchTab('dashboard', this)">
           <div class="nav-icon">📊</div><span>看板</span>
@@ -1002,6 +1130,9 @@ function getWebAppHTML() {
         <div class="nav-item" onclick="switchTab('gallery', this)">
           <div class="nav-icon">🖼️</div><span>画廊</span>
         </div>
+        <div class="nav-item" onclick="switchTab('history', this)">
+          <div class="nav-icon">📜</div><span>足迹</span>
+        </div>
       </div>
 
       <script>
@@ -1009,6 +1140,7 @@ function getWebAppHTML() {
         tg.expand(); 
         tg.ready();  
 
+        // 适配 Telegram 原生主题色
         document.documentElement.style.setProperty('--tg-theme-bg-color', tg.themeParams.bg_color || '#f3f4f6');
         document.documentElement.style.setProperty('--tg-theme-text-color', tg.themeParams.text_color || '#222222');
         document.documentElement.style.setProperty('--tg-theme-button-color', tg.themeParams.button_color || '#ff758c');
@@ -1017,9 +1149,11 @@ function getWebAppHTML() {
 
         const user = tg.initDataUnsafe?.user;
         if (user) {
-          document.getElementById('welcome-text').innerText = '欢迎回来,' + (user.first_name || '主人') + ' 喵！';
+          document.getElementById('welcome-text').innerText = '欢迎回来, ' + (user.first_name || '主人') + ' 喵！';
+          fetchAppData(user.id);
         } else {
-          document.getElementById('welcome-text').innerText = '欢迎访问网页端喵！';
+          document.getElementById('welcome-text').innerText = '请在 Telegram 客户端内打开喵！';
+          document.getElementById('gallery-container').innerHTML = '<p style="grid-column: span 2; text-align: center; font-size: 13px; opacity: 0.6;">环境异常，无法获取身份信息</p>';
         }
 
         function switchTab(tabId, el) {
@@ -1029,6 +1163,157 @@ function getWebAppHTML() {
           el.classList.add('active');
           tg.HapticFeedback.impactOccurred('light');
         }
+        
+        // 核心：请求后端数据并动态渲染
+        async function fetchAppData(userId) {
+          try {
+            const response = await fetch('/api/webapp/data', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ user_id: userId })
+            });
+            
+            if (!response.ok) throw new Error('网络响应异常');
+            const data = await response.json();
+
+            // 1. 渲染数据看板
+            if (data.dashboard) {
+              document.getElementById('stat-media').innerText = data.dashboard.total_media;
+              document.getElementById('stat-views').innerText = data.dashboard.total_views;
+              document.getElementById('stat-groups').innerText = data.dashboard.total_groups;
+              document.getElementById('stat-anti').innerText = data.dashboard.total_anti;
+            }
+
+            // 渲染活跃榜
+            if (data.top_users && data.top_users.length > 0) {
+              document.getElementById('top-users-list').innerHTML = data.top_users.map((u, i) => 
+                '<li class="top-user-li"><span>' + (i===0?'🥇':(i===1?'🥈':'🥉')) + ' ' + (u.first_name || '神秘人') + '</span><b>' + u.c + ' 次</b></li>'
+              ).join('');
+            } else {
+              document.getElementById('top-users-list').innerHTML = '<li>暂无数据喵</li>';
+            }
+
+            // 2. 渲染画廊瀑布流 (收藏夹)
+            const gallery = document.getElementById('gallery-container');
+            if (data.favorites && data.favorites.length > 0) {
+              gallery.innerHTML = data.favorites.map(item => {
+                // 🌟 恢复：完全解析视频、图片、文件的图标
+                const icon = item.media_type === 'video' ? '🎬' : (item.media_type === 'photo' ? '🖼️' : '📁');
+                const caption = item.caption ? item.caption.substring(0, 10) + '...' : '已收藏记录';
+                const chatIdStr = String(item.chat_id).replace('-100', '');
+                const deepLink = 'https://t.me/c/' + chatIdStr + '/' + item.message_id;
+                
+                return '<div class="gallery-item" id="fav-item-' + item.media_id + '">' +
+                         '<div class="gallery-icon">' + icon + '</div>' +
+                         '<div class="gallery-title">' + caption + '</div>' +
+                         '<div style="display: flex; gap: 6px;">' +
+                           '<button class="gallery-btn" style="flex: 1;" onclick="tg.openTelegramLink(\\'' + deepLink + '\\')">👀 围观</button>' +
+                           '<button class="gallery-btn" style="background-color: #ff4d4f; width: 36px; padding: 0;" onclick="removeFav(' + item.media_id + ', this)">🗑️</button>' +
+                         '</div>' +
+                       '</div>';
+              }).join('');
+            } else {
+              gallery.innerHTML = '<p style="grid-column: span 2; text-align: center; font-size: 13px; opacity: 0.6;">收藏夹空空如也喵~</p>';
+            }
+
+            // 3. 渲染历史足迹瀑布流 (历史记录)
+            const historyContainer = document.getElementById('history-container');
+            if (data.history && data.history.length > 0) {
+              historyContainer.innerHTML = data.history.map(item => {
+                const icon = item.media_type === 'video' ? '🎬' : (item.media_type === 'photo' ? '🖼️' : '📁');
+                const caption = item.caption ? item.caption.substring(0, 10) + '...' : '已看记录';
+                const chatIdStr = String(item.chat_id).replace('-100', '');
+                const deepLink = 'https://t.me/c/' + chatIdStr + '/' + item.message_id;
+                
+                return '<div class="gallery-item" id="hist-item-' + item.hist_id + '">' +
+                         '<div class="gallery-icon">' + icon + '</div>' +
+                         '<div class="gallery-title">' + caption + '</div>' +
+                         '<div style="display: flex; gap: 6px;">' +
+                           '<button class="gallery-btn" style="flex: 1;" onclick="tg.openTelegramLink(\\'' + deepLink + '\\')">👀 围观</button>' +
+                           '<button class="gallery-btn" style="background-color: #ff4d4f; width: 36px; padding: 0;" onclick="removeHist(' + item.hist_id + ', this)">🗑️</button>' +
+                         '</div>' +
+                       '</div>';
+              }).join('');
+            } else {
+              historyContainer.innerHTML = '<p style="grid-column: span 2; text-align: center; font-size: 13px; opacity: 0.6;">这里干干净净的，没有留下足迹喵~</p>';
+            }
+
+          } catch (err) {
+            console.error('获取数据失败:', err);
+            // 发生错误时，同时更新两个容器的提示信息
+            document.getElementById('gallery-container').innerHTML = '<p style="grid-column: span 2; text-align: center; color: #ff758c; font-size: 13px;">呜呜，连接数据库失败了喵...</p>';
+            document.getElementById('history-container').innerHTML = '<p style="grid-column: span 2; text-align: center; color: #ff758c; font-size: 13px;">呜呜，连接数据库失败了喵...</p>';
+          }
+        }
+
+        // 记得在 script 里补上这个无刷新抹除的函数哦：
+        async function removeHist(histId, btnElement) {
+          if (!user) return;
+          tg.HapticFeedback.impactOccurred('medium');
+          const originalText = btnElement.innerText;
+          btnElement.innerText = '...';
+          btnElement.disabled = true;
+
+          try {
+            const res = await fetch('/api/webapp/remove_hist', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ user_id: user.id, hist_id: histId })
+            });
+            const data = await res.json();
+            if (data.success) {
+               const itemCard = document.getElementById('hist-item-' + histId);
+               itemCard.style.opacity = '0';
+               itemCard.style.transform = 'scale(0.9)';
+               setTimeout(() => itemCard.remove(), 200);
+            } else {
+               btnElement.innerText = originalText;
+               btnElement.disabled = false;
+               tg.showAlert('抹除失败：' + (data.error || '未知错误'));
+            }
+          } catch(e) {
+            btnElement.innerText = originalText;
+            btnElement.disabled = false;
+            tg.showAlert('网络错误喵！');
+          }
+        }
+        
+        // 新增：处理取消收藏逻辑
+        async function removeFav(mediaId, btnElement) {
+          if (!user) return;
+          
+          // 给用户一点点击反馈
+          tg.HapticFeedback.impactOccurred('medium');
+          const originalText = btnElement.innerText;
+          btnElement.innerText = '...';
+          btnElement.disabled = true;
+
+          try {
+            const res = await fetch('/api/webapp/remove_fav', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ user_id: user.id, media_id: mediaId })
+            });
+            const data = await res.json();
+            
+            if (data.success) {
+               // 成功后，丝滑地从页面上移除该卡片
+               const itemCard = document.getElementById('fav-item-' + mediaId);
+               itemCard.style.opacity = '0';
+               itemCard.style.transform = 'scale(0.9)';
+               setTimeout(() => itemCard.remove(), 200); // 等待 CSS 动画结束
+               tg.HapticFeedback.notificationOccurred('success');
+            } else {
+               btnElement.innerText = originalText;
+               btnElement.disabled = false;
+               tg.showAlert('移除失败：' + (data.error || '未知错误'));
+            }
+          } catch(e) {
+            btnElement.innerText = originalText;
+            btnElement.disabled = false;
+            tg.showAlert('网络错误，请稍后再试喵！');
+          }
+        }
       </script>
     </body>
     </html>
@@ -1036,7 +1321,78 @@ function getWebAppHTML() {
 }
 
 async function handleWebAppData(request, env) {
-  return new Response(JSON.stringify({ status: "working on it!" }), { headers: { 'Content-Type': 'application/json' } });
+  if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405 });
+
+  try {
+    const body = await request.json();
+    const userId = body.user_id; 
+
+    if (!userId) {
+      return new Response(JSON.stringify({ error: "未获取到用户身份" }), { status: 400 });
+    }
+
+        // 并发查询 (已修正表名为 user_history)
+    const [mediaRes, viewRes, groupRes, favRes, histRes, antiRes, userRes] = await Promise.all([
+      env.D1.prepare(`SELECT count(*) as c FROM media_library`).first(),
+      env.D1.prepare(`SELECT SUM(view_count) as v FROM media_library`).first(),
+      env.D1.prepare(`SELECT COUNT(DISTINCT chat_id) as g FROM config_topics WHERE chat_id < 0`).first(),
+      env.D1.prepare(`
+        SELECT f.media_id as id, m.media_type, m.caption, m.chat_id, m.message_id 
+        FROM user_favorites f LEFT JOIN media_library m ON f.media_id = m.id 
+        WHERE f.user_id = ? ORDER BY f.saved_at DESC LIMIT 20
+      `).bind(userId).all(),
+      env.D1.prepare(`
+        SELECT h.id as id, m.media_type, m.caption, m.chat_id, m.message_id 
+        FROM user_history h LEFT JOIN media_library m ON h.media_id = m.id 
+        WHERE h.user_id = ? ORDER BY h.viewed_at DESC LIMIT 50
+      `).bind(userId).all(),
+      env.D1.prepare(`SELECT count(*) as c FROM served_history`).first(),
+      // 🐛 修复核心：这里也必须换成 user_history
+      env.D1.prepare(`SELECT u.user_id, r.first_name, count(*) as c FROM user_history u LEFT JOIN user_roster r ON u.user_id = r.user_id GROUP BY u.user_id ORDER BY c DESC LIMIT 5`).all()
+    ]);
+
+
+    const responseData = {
+      dashboard: {
+        total_media: mediaRes?.c || 0,
+        total_views: viewRes?.v || 0,
+        total_groups: groupRes?.g || 0,
+        total_anti: antiRes?.c || 0
+      },
+      top_users: userRes.results || [],
+      favorites: favRes.results || [],
+      history: histRes.results || []
+    };
+
+    return new Response(JSON.stringify(responseData), { 
+      headers: { 'Content-Type': 'application/json' } 
+    });
+
+  } catch (err) {
+    console.error('Web App API Error:', err);
+    return new Response(JSON.stringify({ error: "服务器内部错误" }), { status: 500 });
+  }
+}
+
+async function handleWebAppRemoveFav(request, env) {
+  if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405 });
+
+  try {
+    const body = await request.json();
+    const userId = body.user_id; 
+    const mediaId = body.media_id;
+
+    if (!userId || !mediaId) {
+      return new Response(JSON.stringify({ success: false, error: "参数不完整" }), { status: 400 });
+    }
+
+    await env.D1.prepare(`DELETE FROM user_favorites WHERE user_id = ? AND media_id = ?`).bind(userId, mediaId).run();
+
+    return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
+  } catch (err) {
+    console.error('Web App Remove Fav Error:', err);
+    return new Response(JSON.stringify({ success: false, error: "服务器内部错误" }), { status: 500 });
+  }
 }
 
 /* =========================================================================
@@ -1046,7 +1402,6 @@ async function getUserAllowedGroups(userId, env) {
   const { results } = await env.D1.prepare(`SELECT DISTINCT chat_id FROM config_topics WHERE chat_id < 0`).all();
   if (!results || results.length === 0) return [];
 
-  // P0: 并发检查所有群组,替代串行 for loop
   const checks = results.map(row =>
     isUserInGroup(row.chat_id, userId, env).then(inGroup => inGroup ? row.chat_id : null)
   );
@@ -1054,7 +1409,6 @@ async function getUserAllowedGroups(userId, env) {
 }
 
 async function isUserInGroup(groupId, userId, env) {
-  // P0: TTL 缓存,避免对同一用户/群组重复调用 Telegram API
   const cacheKey = `${groupId}:${userId}`;
   const now = Date.now();
   const cached = groupMembershipCache.get(cacheKey);
@@ -1064,7 +1418,6 @@ async function isUserInGroup(groupId, userId, env) {
   const data = await res.json();
   const inGroup = data.ok && ['creator', 'administrator', 'member', 'restricted'].includes(data.result.status);
 
-  // 写入缓存,LRU 超限时淘汰最旧条目
   if (groupMembershipCache.size >= GROUP_MEMBER_CACHE_MAX) {
     groupMembershipCache.delete(groupMembershipCache.keys().next().value);
   }
@@ -1088,14 +1441,13 @@ async function tgAPI(method, payload, env) {
   });
 }
 
-// ==== V5.5 更新：支持基于 Chat ID 读取独立默认配置 ====
 async function getSetting(chatId, key, env) {
   const res = await env.D1.prepare(`SELECT value FROM chat_settings WHERE chat_id = ? AND key = ?`).bind(chatId, key).first();
   if (res) return res.value;
   return SETTING_DEFAULTS[key] ?? null;
 }
 
-// P1: 批量读取多个设置,单次 D1 查询
+// P1: 批量读取多个设置
 async function getSettingsBatch(chatId, keys, env) {
   const uniqueKeys = [...new Set(keys)];
   const placeholders = uniqueKeys.map(() => '?').join(', ');
@@ -1108,30 +1460,27 @@ async function getSettingsBatch(chatId, keys, env) {
   return out;
 }
 
-// P1: id-pivot 随机策略,替代 ORDER BY RANDOM() 全表扫描
-// 原理：随机选取一个 id pivot,优先找 id >= pivot 的第一条,找不到则回绕找 id < pivot 的第一条
-async function selectRandomMedia(category, sourceChatId, useAntiRepeat, env) {
-  const maxRow = await env.D1.prepare(
-    `SELECT MAX(id) AS max_id FROM media_library WHERE category_name = ? AND chat_id = ?`
-  ).bind(category, sourceChatId).first();
-  if (!maxRow || maxRow.max_id === null) return null;
-
-  const pivot = Math.floor(Math.random() * maxRow.max_id) + 1;
-  const antiClause = useAntiRepeat
-    ? `AND NOT EXISTS (SELECT 1 FROM served_history sh WHERE sh.media_id = m.id)`
+// 终极随机策略：内存映射随机（彻底解决 ID 断层导致的概率黑洞）
+async function selectRandomMedia(category, sourceChatId, useAntiRepeat, excludeId, env) {
+  const antiClause = useAntiRepeat 
+    ? `AND m.id NOT IN (SELECT media_id FROM served_history)` 
+    : '';
+  const excludeClause = excludeId 
+    ? `AND m.id != ${Number(excludeId)}` 
     : '';
 
-  // 先找 id >= pivot 的第一条
-  let media = await env.D1.prepare(
-    `SELECT * FROM media_library m WHERE m.category_name = ? AND m.chat_id = ? ${antiClause} AND m.id >= ? ORDER BY m.id LIMIT 1`
-  ).bind(category, sourceChatId, pivot).first();
+  const { results } = await env.D1.prepare(
+    `SELECT m.id FROM media_library m WHERE m.category_name = ? AND m.chat_id = ? ${antiClause} ${excludeClause}`
+  ).bind(category, sourceChatId).all();
 
-  if (media) return media;
+  if (!results || results.length === 0) return null;
 
-  // 回绕：找 id < pivot 的最后一条（按 id 升序取第一条等价）
-  return env.D1.prepare(
-    `SELECT * FROM media_library m WHERE m.category_name = ? AND m.chat_id = ? ${antiClause} AND m.id < ? ORDER BY m.id LIMIT 1`
-  ).bind(category, sourceChatId, pivot).first();
+  const randomIdx = Math.floor(Math.random() * results.length);
+  const targetId = results[randomIdx].id;
+
+  return await env.D1.prepare(
+    `SELECT * FROM media_library WHERE id = ?`
+  ).bind(targetId).first();
 }
 
 async function isAdmin(chatId, userId, env) {
@@ -1142,5 +1491,18 @@ async function isAdmin(chatId, userId, env) {
 }
 
 function makeDeepLink(chatId, messageId) {
-  return `https://t.me/c/${String(chatId).替换('-100', '')}/${messageId}`;
+  return `https://t.me/c/${String(chatId).replace('-100', '')}/${messageId}`;
+}
+
+async function handleWebAppRemoveHist(request, env) {
+  if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405 });
+  try {
+    const body = await request.json();
+    if (!body.user_id || !body.hist_id) return new Response(JSON.stringify({ success: false, error: "参数不完整" }), { status: 400 });
+    
+    await env.D1.prepare(`DELETE FROM user_history WHERE user_id = ? AND id = ?`).bind(body.user_id, body.hist_id).run();
+    return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
+  } catch (err) {
+    return new Response(JSON.stringify({ success: false, error: "服务器内部错误" }), { status: 500 });
+  }
 }

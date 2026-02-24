@@ -132,7 +132,11 @@ async function handleSetup(origin, env) {
 
       // 触发器：维持历史记录在50条
       `CREATE TRIGGER IF NOT EXISTS limit_user_history AFTER INSERT ON user_history BEGIN DELETE FROM user_history WHERE id NOT IN (SELECT id FROM user_history WHERE user_id = NEW.user_id ORDER BY viewed_at DESC LIMIT 50) AND user_id = NEW.user_id; END;`,
-      `CREATE TRIGGER IF NOT EXISTS limit_group_history AFTER INSERT ON group_history BEGIN DELETE FROM group_history WHERE id NOT IN (SELECT id FROM group_history WHERE chat_id = NEW.chat_id ORDER BY viewed_at DESC LIMIT 50) AND chat_id = NEW.chat_id; END;`
+      `CREATE TRIGGER IF NOT EXISTS limit_group_history AFTER INSERT ON group_history BEGIN DELETE FROM group_history WHERE id NOT IN (SELECT id FROM group_history WHERE chat_id = NEW.chat_id ORDER BY viewed_at DESC LIMIT 50) AND chat_id = NEW.chat_id; END;`,
+
+      `CREATE INDEX IF NOT EXISTS idx_user_history_user_viewed ON user_history (user_id, viewed_at DESC);`,
+      `CREATE INDEX IF NOT EXISTS idx_user_history_user_chat ON user_history (user_id, chat_id, viewed_at DESC);`,
+      `CREATE INDEX IF NOT EXISTS idx_group_history_chat_viewed ON group_history (chat_id, viewed_at DESC);`
     ];
 
     for (const sql of initSQL) await env.D1.prepare(sql).run();
@@ -261,7 +265,7 @@ async function handleMessage(message, env, ctx) {
   if (text.startsWith('/start')) return sendMainMenu(chatId, topicId, env, userId);
 
   if (text.startsWith('/help')) {
-    const helpText = `📖 **籽青的说明书喵~ (≧∇≦)**\n/start - 唤出籽青的主菜单\n\n**【管理员专属指令喵】**\n/bind <分类名> - 将当前话题绑定为采集库\n/bind_output - 将当前话题设为专属推送展示窗口\n/import_json - 获取关于导入历史消息的说明\n\n**【快捷管理魔法】**\n直接回复某张图片/视频：\n发送 \`/del\` - 彻底抹除它\n发送 \`/move\` - 将它转移到其他分类`;
+    const helpText = `📖 **籽青的说明书喵~ (≧∇≦)**\n/start - 唤出籽青的主菜单\n\n**【管理员专属指令喵】**\n/bind <分类名> - 将当前话题绑定为采集库\n/bind_output - 将当前话题设为专属推送展示窗口\n/import_json - 获取关于导入历史消息的说明\n\n**【快捷管理魔法】**\n直接回复某张图片/视频：\n发送 \`/d\` - 彻底抹除它\n发送 \`/mv\` - 将它转移到其他分类`;
     await tgAPI('sendMessage', { chat_id: chatId, message_thread_id: topicId, text: helpText, parse_mode: 'Markdown' }, env);
     return;
   }
@@ -272,12 +276,12 @@ async function handleMessage(message, env, ctx) {
     return;
   }
 
-  // 🌟 快捷回复管理魔法 (/del 和 /move)
-  if (message.reply_to_message && (text.startsWith('/del') || text.startsWith('/move'))) {
+  // 🌟 快捷回复管理魔法 (/d 和 /mv)
+  if (message.reply_to_message && (text.startsWith('/d') || text.startsWith('/mv'))) {
     if (!(await isAdmin(chatId, userId, env))) {
       return tgAPI('sendMessage', { chat_id: chatId, message_thread_id: topicId, reply_to_message_id: message.message_id, text: "🚨 呜呜，只有管理员主人才可以使用回复魔法哦！" }, env);
     }
-    
+
     const info = extractMediaInfo(message.reply_to_message);
     if (!info.fileUniqueId) {
       return tgAPI('sendMessage', { chat_id: chatId, message_thread_id: topicId, reply_to_message_id: message.message_id, text: "喵？这似乎不是一个标准的图片或视频记录哦！" }, env);
@@ -288,16 +292,18 @@ async function handleMessage(message, env, ctx) {
       return tgAPI('sendMessage', { chat_id: chatId, message_thread_id: topicId, reply_to_message_id: message.message_id, text: "呜呜，籽青在数据库里找不到它的真身，可能早就被删除了喵~" }, env);
     }
 
-    if (text.startsWith('/del')) {
-      await env.D1.prepare(`DELETE FROM media_library WHERE id = ?`).bind(media.id).run();
-      await env.D1.prepare(`DELETE FROM served_history WHERE media_id = ?`).bind(media.id).run();
-      await env.D1.prepare(`DELETE FROM user_favorites WHERE media_id = ?`).bind(media.id).run();
-      await env.D1.prepare(`DELETE FROM user_history WHERE media_id = ?`).bind(media.id).run();
-      await env.D1.prepare(`DELETE FROM group_history WHERE media_id = ?`).bind(media.id).run();
+    if (text.startsWith('/d')) {
+      await env.D1.batch([
+        env.D1.prepare(`DELETE FROM media_library WHERE id = ?`).bind(media.id),
+        env.D1.prepare(`DELETE FROM served_history WHERE media_id = ?`).bind(media.id),
+        env.D1.prepare(`DELETE FROM user_favorites WHERE media_id = ?`).bind(media.id),
+        env.D1.prepare(`DELETE FROM user_history WHERE media_id = ?`).bind(media.id),
+        env.D1.prepare(`DELETE FROM group_history WHERE media_id = ?`).bind(media.id)
+      ]);
       return tgAPI('sendMessage', { chat_id: chatId, message_thread_id: topicId, reply_to_message_id: message.reply_to_message.message_id, text: "🗑️ 抹除成功！这个媒体已经被籽青彻底销毁啦喵！" }, env);
-    } 
-    
-    if (text.startsWith('/move')) {
+    }
+
+    if (text.startsWith('/mv')) {
       const { results } = await env.D1.prepare(`SELECT DISTINCT category_name FROM config_topics WHERE chat_id = ? AND category_name != 'output'`).bind(chatId).all();
       if (!results || results.length === 0) {
         return tgAPI('sendMessage', { chat_id: chatId, message_thread_id: topicId, text: "本群还没绑定其他分类呢喵~" }, env);
@@ -994,9 +1000,8 @@ async function showUnbindList(chatId, msgId, env) {
 // 🌟 究极防弹版：增强版全知数据看板 (自带时间戳刷新与全类型安全转换)
 async function showStats(chatId, msgId, env) {
   try {
-    const [mediaRes, topicRes, viewRes, catRes, userRes, antiRes, recentAntiRes] = await Promise.all([
+    const [mediaRes, viewRes, catRes, userRes, antiRes, recentAntiRes] = await Promise.all([
       env.D1.prepare(`SELECT count(*) as c FROM media_library WHERE chat_id = ?`).bind(chatId).first(),
-      env.D1.prepare(`SELECT count(*) as c FROM config_topics WHERE chat_id = ?`).bind(chatId).first(),
       env.D1.prepare(`SELECT sum(view_count) as v FROM media_library WHERE chat_id = ?`).bind(chatId).first(),
       env.D1.prepare(`SELECT category_name, count(*) as c FROM media_library WHERE chat_id = ? GROUP BY category_name`).bind(chatId).all(),
       // 这里的表名已经彻底确认为 user_history
@@ -1497,16 +1502,15 @@ async function getSettingsBatch(chatId, keys, env) {
 
 // 终极随机策略：内存映射随机（彻底解决 ID 断层导致的概率黑洞）
 async function selectRandomMedia(category, sourceChatId, useAntiRepeat, excludeId, env) {
-  const antiClause = useAntiRepeat 
-    ? `AND m.id NOT IN (SELECT media_id FROM served_history)` 
+  const antiClause = useAntiRepeat
+    ? `AND NOT EXISTS (SELECT 1 FROM served_history sh WHERE sh.media_id = m.id)`
     : '';
-  const excludeClause = excludeId 
-    ? `AND m.id != ${Number(excludeId)}` 
-    : '';
+  const excludeClause = excludeId ? `AND m.id != ?` : '';
+  const binds = excludeId ? [category, sourceChatId, excludeId] : [category, sourceChatId];
 
   const { results } = await env.D1.prepare(
     `SELECT m.id FROM media_library m WHERE m.category_name = ? AND m.chat_id = ? ${antiClause} ${excludeClause}`
-  ).bind(category, sourceChatId).all();
+  ).bind(...binds).all();
 
   if (!results || results.length === 0) return null;
 

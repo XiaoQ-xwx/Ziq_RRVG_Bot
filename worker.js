@@ -22,10 +22,51 @@ const GROUP_MEMBER_CACHE_TTL_MS = 60_000;
 const GROUP_MEMBER_CACHE_MAX = 4096;
 const groupMembershipCache = new Map();
 
+let isInstanceAwake = false;
+
 export default {
   async fetch(request, env, ctx) {
     try {
       const url = new URL(request.url);
+
+      // Webhook 路由：最高优先级，绝不被冷启动阻塞
+      // 先返回 200 给 Telegram，防止退避机制触发
+      if (request.method === 'POST' && url.pathname === '/webhook') {
+        const update = await request.json();
+        // 冷启动时把 setWebhook 注册丢到后台，不阻塞本次响应
+        if (!isInstanceAwake) {
+          isInstanceAwake = true;
+          ctx.waitUntil((async () => {
+            try {
+              const origin = new URL(request.url).origin;
+              await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN_ENV}/setWebhook`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ url: `${origin}/webhook` })
+              });
+            } catch (e) { console.error("后台 Webhook 注册失败:", e.message); }
+          })());
+        }
+        ctx.waitUntil(handleUpdate(update, env, ctx));
+        return new Response('OK', { status: 200 });
+      }
+
+      // 非 Webhook 路由的冷启动初始化（GET / 等场景可以阻塞等待）
+      if (!isInstanceAwake) {
+        try {
+          await env.D1.prepare(`SELECT 1`).first();
+          const currentUrl = new URL(request.url).origin;
+          await fetchWithRetry(`https://api.telegram.org/bot${env.BOT_TOKEN_ENV}/setWebhook`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ url: `${currentUrl}/webhook` })
+          }, 3, 1000);
+          console.log("🛡️ 满级复活甲触发：已稳稳地向 TG 重新报到喵！");
+        } catch (e) {
+          console.error("复活彻底失败（重试耗尽）:", e.message);
+        }
+        isInstanceAwake = true;
+      }
 
       if (request.method === 'GET' && url.pathname === '/') {
         return await handleSetup(url.origin, env);
@@ -46,12 +87,6 @@ export default {
 
       if (request.method === 'POST' && url.pathname === '/api/webapp/remove_hist') {
         return await handleWebAppRemoveHist(request, env);
-      }
-
-      if (request.method === 'POST' && url.pathname === '/webhook') {
-        const update = await request.json();
-        ctx.waitUntil(handleUpdate(update, env, ctx));
-        return new Response('OK', { status: 200 });
       }
 
       if (request.method === 'POST' && url.pathname === '/api/import') {
@@ -1505,4 +1540,39 @@ async function handleWebAppRemoveHist(request, env) {
   } catch (err) {
     return new Response(JSON.stringify({ success: false, error: "服务器内部错误" }), { status: 500 });
   }
+}
+
+async function fetchWithRetry(url, options, retries = 3, backoff = 1000) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      const controller = new AbortController();
+      // 设定 5 秒超时，如果 Telegram 卡住不理人，就强行打断
+      const timeoutId = setTimeout(() => controller.abort(), 5000);
+      const response = await fetch(url, { ...options, signal: controller.signal });
+      clearTimeout(timeoutId);
+
+      if (response.ok) {
+        return response; // 成功啦！
+      }
+      
+      // 如果触发了 Telegram 的限频限制 (429 Too Many Requests)
+      if (response.status === 429) {
+        const retryAfter = response.headers.get('Retry-After') || 5;
+        const delay = parseInt(retryAfter) * 1000;
+        console.warn(`⚠️ 触发 TG 限流，籽青乖乖等待 ${delay}ms 后重试喵...`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        continue;
+      }
+      
+      throw new Error(`HTTP 报错状态码: ${response.status}`);
+    } catch (error) {
+      if (i === retries - 1) throw error; // 如果最后一次也失败了，就真的报错
+      
+      // 指数退避策略：失败后等待时间翻倍 (1秒 -> 2秒 -> 4秒...)
+      const waitTime = backoff * Math.pow(2, i);
+      console.warn(`⚠️ 请求失败 (${error.message})，籽青将在 ${waitTime}ms 后进行第 ${i + 1} 次冲锋喵！`);
+      await new Promise(resolve => setTimeout(resolve, waitTime));
+    }
+  }
+  throw new Error(`呜呜，在 ${retries} 次努力后还是失败了喵：${url}`);
 }

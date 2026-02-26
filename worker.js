@@ -311,7 +311,9 @@ async function handleMessage(message, env, ctx) {
   }
 
   if (text === '/bd cancel') {
-    await env.D1.prepare(`DELETE FROM batch_sessions WHERE chat_id = ? AND user_id = ?`).bind(chatId, userId).run();
+    const session = await env.D1.prepare(`SELECT id FROM batch_sessions WHERE chat_id = ? AND user_id = ? AND mode = 'bd'`).bind(chatId, userId).first();
+    if (!session) return tgAPI('sendMessage', { chat_id: chatId, message_thread_id: topicId, text: "当前没有进行中的批量删除操作喵～" }, env);
+    await env.D1.prepare(`DELETE FROM batch_sessions WHERE id = ?`).bind(session.id).run();
     return tgAPI('sendMessage', { chat_id: chatId, message_thread_id: topicId, text: "已退出批量删除模式喵～" }, env);
   }
 
@@ -347,12 +349,17 @@ async function handleMessage(message, env, ctx) {
   }
 
   if (text === '/bmv cancel') {
-    await env.D1.prepare(`DELETE FROM batch_sessions WHERE chat_id = ? AND user_id = ?`).bind(chatId, userId).run();
+    const session = await env.D1.prepare(`SELECT id FROM batch_sessions WHERE chat_id = ? AND user_id = ? AND mode = 'bmv'`).bind(chatId, userId).first();
+    if (!session) return tgAPI('sendMessage', { chat_id: chatId, message_thread_id: topicId, text: "当前没有进行中的批量转移操作喵～" }, env);
+    await env.D1.prepare(`DELETE FROM batch_sessions WHERE id = ?`).bind(session.id).run();
     return tgAPI('sendMessage', { chat_id: chatId, message_thread_id: topicId, text: "已退出批量转移模式喵～" }, env);
   }
 
   // 🌟 快捷回复管理魔法 (/d 和 /mv) — 单条回复模式
-  if (message.reply_to_message && (text.startsWith('/d') || text.startsWith('/mv'))) {
+  // 排除批量格式：/d <数字|all> 和 /mv <数字|all> <分类>，让它们落到后面的批量路由
+  const isBatchDFormat = /^\/d\s+(all|\d+)$/.test(text);
+  const isBatchMvFormat = /^\/mv\s+(all|\d+)\s+.+$/.test(text);
+  if (message.reply_to_message && (text.startsWith('/d') || text.startsWith('/mv')) && !isBatchDFormat && !isBatchMvFormat) {
     if (!(await isAdmin(chatId, userId, env))) {
       return tgAPI('sendMessage', { chat_id: chatId, message_thread_id: topicId, reply_to_message_id: message.message_id, text: "🚨 呜呜，只有管理员主人才可以使用回复魔法哦！" }, env);
     }
@@ -542,17 +549,28 @@ async function handleMessage(message, env, ctx) {
         if (!dbMedia) {
           return tgAPI('sendMessage', { chat_id: chatId, message_thread_id: topicId, reply_to_message_id: message.message_id, text: "⚠️ 该媒体不在数据库中，已跳过喵～" }, env);
         }
-        const collectedIds = JSON.parse(batchSession.collected_ids || '[]');
-        const collectedMsgIds = JSON.parse(batchSession.collected_msg_ids || '[]');
-        // 去重
-        if (collectedIds.includes(dbMedia.id)) {
-          return tgAPI('sendMessage', { chat_id: chatId, message_thread_id: topicId, reply_to_message_id: message.message_id, text: "这条已经收集过了喵～" }, env);
+        // 原子操作：用 SQL json 函数在数据库层面追加，避免并发竞态覆盖
+        // 先检查去重（在 SQL 层面用 INSTR 检查）
+        const existing = await env.D1.prepare(
+          `SELECT INSTR(collected_ids, ?) as found FROM batch_sessions WHERE id = ?`
+        ).bind(`${dbMedia.id}`, batchSession.id).first();
+        if (existing && existing.found > 0) {
+          // 静默跳过重复，不回复
+          return;
         }
-        collectedIds.push(dbMedia.id);
-        collectedMsgIds.push(message.message_id);
-        await env.D1.prepare(`UPDATE batch_sessions SET collected_ids = ?, collected_msg_ids = ? WHERE id = ?`).bind(JSON.stringify(collectedIds), JSON.stringify(collectedMsgIds), batchSession.id).run();
-        const modeText = batchSession.mode === 'bd' ? '/bd end' : '/bmv end';
-        return tgAPI('sendMessage', { chat_id: chatId, message_thread_id: topicId, reply_to_message_id: message.message_id, text: `✅ 已收集第 ${collectedIds.length} 条，继续转发或发送 ${modeText} 结束喵～` }, env);
+        // 原子追加：用 json_insert + json_array_length 在 SQL 层面追加元素
+        await env.D1.prepare(
+          `UPDATE batch_sessions SET collected_ids = json_insert(collected_ids, '$[#]', ?), collected_msg_ids = json_insert(collected_msg_ids, '$[#]', ?) WHERE id = ?`
+        ).bind(dbMedia.id, message.message_id, batchSession.id).run();
+        // 查询最新计数
+        const updated = await env.D1.prepare(`SELECT json_array_length(collected_ids) as cnt FROM batch_sessions WHERE id = ?`).bind(batchSession.id).first();
+        const cnt = updated?.cnt || 1;
+        // 静默收集：只在每 5 条和第 1 条时回复，减少刷屏
+        if (cnt === 1 || cnt % 5 === 0) {
+          const modeText = batchSession.mode === 'bd' ? '/bd end' : '/bmv end';
+          await tgAPI('sendMessage', { chat_id: chatId, message_thread_id: topicId, text: `📦 已收集 ${cnt} 条，完成后发送 ${modeText} 喵～` }, env);
+        }
+        return;
       }
     }
   }
@@ -654,10 +672,13 @@ async function handleCallback(callback, env, ctx) {
     const catMatch = msgText.match(/【(.+?)】/);
     if (!catMatch) return tgAPI('editMessageText', { chat_id: chatId, message_id: msgId, text: "❌ 无法识别分类信息，请重新操作喵～" }, env);
     const category = catMatch[1];
+    const beforeRes = await env.D1.prepare(`SELECT count(*) as c FROM media_library WHERE chat_id = ? AND category_name = ?`).bind(chatId, category).first();
+    const before = beforeRes?.c || 0;
     const { results } = await env.D1.prepare(`SELECT id FROM media_library WHERE chat_id = ? AND category_name = ? ORDER BY id DESC LIMIT ?`).bind(chatId, category, count).all();
     if (!results || results.length === 0) return tgAPI('editMessageText', { chat_id: chatId, message_id: msgId, text: "该分类已经没有记录了喵～" }, env);
     const deleted = await batchDeleteMediaByIds(results.map(r => r.id), env);
-    await tgAPI('editMessageText', { chat_id: chatId, message_id: msgId, text: `🗑️ 批量删除完成！已从【${category}】中抹除 ${deleted} 条记录喵！` }, env);
+    const after = before - deleted;
+    await tgAPI('editMessageText', { chat_id: chatId, message_id: msgId, text: `🗑️ 批量删除完成！已从【${category}】中抹除 ${deleted} 条记录喵！\n📊 ${before} 条 → ${after} 条` }, env);
   }
 
   else if (data === 'bmc_cfm') {
@@ -685,10 +706,13 @@ async function handleCallback(callback, env, ctx) {
     const session = await env.D1.prepare(`SELECT * FROM batch_sessions WHERE chat_id = ? AND user_id = ? AND mode = 'bd'`).bind(chatId, userId).first();
     if (!session) return tgAPI('editMessageText', { chat_id: chatId, message_id: msgId, text: "❌ 会话已过期，请重新操作喵～" }, env);
     const ids = JSON.parse(session.collected_ids || '[]');
+    const beforeRes = await env.D1.prepare(`SELECT count(*) as c FROM media_library WHERE chat_id = ?`).bind(chatId).first();
+    const before = beforeRes?.c || 0;
     const deleted = await batchDeleteMediaByIds(ids, env);
+    const after = before - deleted;
     // 保留 session 用于清理转发消息，改 mode 为 cleanup
     await env.D1.prepare(`UPDATE batch_sessions SET mode = 'cleanup' WHERE id = ?`).bind(session.id).run();
-    await tgAPI('editMessageText', { chat_id: chatId, message_id: msgId, text: `🗑️ 批量删除完成！已抹除 ${deleted} 条记录喵！\n\n是否同时删除刚才转发的那些消息？`, reply_markup: { inline_keyboard: [[{ text: "🧹 是，清理掉", callback_data: "bs_clean_yes" }, { text: "📌 不用了", callback_data: "bs_clean_no" }]] } }, env);
+    await tgAPI('editMessageText', { chat_id: chatId, message_id: msgId, text: `🗑️ 批量删除完成！已抹除 ${deleted} 条记录喵！\n📊 本群媒体总量: ${before} 条 → ${after} 条\n\n是否同时删除刚才转发的那些消息？`, reply_markup: { inline_keyboard: [[{ text: "🧹 是，清理掉", callback_data: "bs_clean_yes" }, { text: "📌 不用了", callback_data: "bs_clean_no" }]] } }, env);
   }
 
   else if (data.startsWith('bs_mv_')) {

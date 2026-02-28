@@ -274,7 +274,7 @@ async function handleMessage(message, env, ctx) {
   if (text.startsWith('/start')) return sendMainMenu(chatId, topicId, env, userId);
 
   if (text.startsWith('/help')) {
-    const helpText = `📖 **籽青的说明书喵~ (≧∇≦)**\n/start - 唤出籽青的主菜单\n\n**【管理员专属指令喵】**\n/bind <分类名> - 将当前话题绑定为采集库\n/bind_output - 将当前话题设为专属推送展示窗口\n/import_json - 获取关于导入历史消息的说明\n\n**【快捷管理魔法】**\n直接回复某张图片/视频：\n发送 \`/d\` - 彻底抹除它\n发送 \`/mv\` - 将它转移到其他分类\n\n**【批量操作】**\n\`/d <数量|all>\` - 批量删除当前分类最近N条\n\`/mv <数量|all> <分类名>\` - 批量转移\n\`/bd\` - 进入精确批量删除模式（转发选择）\n\`/bmv\` - 进入精确批量转移模式（转发选择）`;
+    const helpText = `📖 **籽青的说明书喵~ (≧∇≦)**\n/start - 唤出籽青的主菜单\n\n**【管理员专属指令喵】**\n/bind <分类名> - 将当前话题绑定为采集库\n/bind_output - 将当前话题设为专属推送展示窗口\n/import_json - 获取关于导入历史消息的说明\n\n**【快捷管理魔法】**\n直接回复某张图片/视频：\n发送 \`/d\` - 彻底抹除它\n发送 \`/mv\` - 将它转移到其他分类\n发送 \`/list\` - 查看它的收录信息\n\n**【批量操作】**\n\`/d <数量|all>\` - 批量删除当前分类最近N条\n\`/mv <数量|all> <分类名>\` - 批量转移\n\`/bd\` - 进入精确批量删除模式（转发选择）\n\`/bmv\` - 进入精确批量转移模式（转发选择）`;
     await tgAPI('sendMessage', { chat_id: chatId, message_thread_id: topicId, text: helpText, parse_mode: 'Markdown' }, env);
     return;
   }
@@ -353,6 +353,59 @@ async function handleMessage(message, env, ctx) {
     if (!session) return tgAPI('sendMessage', { chat_id: chatId, message_thread_id: topicId, text: "当前没有进行中的批量转移操作喵～" }, env);
     await env.D1.prepare(`DELETE FROM batch_sessions WHERE id = ?`).bind(session.id).run();
     return tgAPI('sendMessage', { chat_id: chatId, message_thread_id: topicId, text: "已退出批量转移模式喵～" }, env);
+  }
+
+  // 🌟 V5.8: /list — 查询回复媒体的收录记录（所有成员可用）
+  if (message.reply_to_message && text.startsWith('/list')) {
+    const info = extractMediaInfo(message.reply_to_message);
+    if (!info.fileUniqueId) {
+      return tgAPI('sendMessage', {
+        chat_id: chatId, message_thread_id: topicId, reply_to_message_id: message.message_id,
+        text: "喵？这不是一条媒体消息哦，请回复一张图片或视频再试试！"
+      }, env);
+    }
+
+    const { results: mediaRecords } = await env.D1.prepare(
+      `SELECT id, message_id, topic_id, category_name, media_type, added_at FROM media_library WHERE file_unique_id = ? AND chat_id = ? ORDER BY added_at ASC`
+    ).bind(info.fileUniqueId, chatId).all();
+
+    if (!mediaRecords || mediaRecords.length === 0) {
+      return tgAPI('sendMessage', {
+        chat_id: chatId, message_thread_id: topicId, reply_to_message_id: message.message_id,
+        text: "呜呜，籽青在库里找不到这个媒体的收录记录喵，可能从未被收录过哦～"
+      }, env);
+    }
+
+    const uniqueTopicIds = [...new Set(mediaRecords.map(r => r.topic_id).filter(t => t != null))];
+    const topicNameMap = {};
+    if (uniqueTopicIds.length > 0) {
+      const ph = uniqueTopicIds.map(() => '?').join(',');
+      const { results: topicRows } = await env.D1.prepare(
+        `SELECT topic_id, category_name FROM config_topics WHERE chat_id = ? AND topic_id IN (${ph}) AND category_name != 'output' LIMIT 50`
+      ).bind(chatId, ...uniqueTopicIds).all();
+      for (const row of (topicRows || [])) topicNameMap[row.topic_id] = row.category_name;
+    }
+
+    const chatIdNum = String(chatId).replace(/^-100/, '');
+    const typeLabel = { photo: '图片', video: '视频', animation: 'GIF', document: '文件' };
+    const lines = mediaRecords.map((rec, idx) => {
+      const topicBound = rec.topic_id ? (topicNameMap[rec.topic_id] || '未知话题') : '无话题';
+      const type = typeLabel[rec.media_type] || rec.media_type || '未知';
+      const addedAt = rec.added_at ? String(rec.added_at).replace('T', ' ').substring(0, 16) : '未知时间';
+      const link = rec.message_id
+        ? (rec.topic_id
+            ? `https://t.me/c/${chatIdNum}/${rec.topic_id}/${rec.message_id}`
+            : `https://t.me/c/${chatIdNum}/${rec.message_id}`)
+        : null;
+      const linkPart = link ? ` — [原消息](${link})` : '';
+      return `*${idx + 1}.* 分类：\`${rec.category_name}\` | 话题：\`${topicBound}\`\n　类型：${type} | 收录于：${addedAt}${linkPart}`;
+    });
+
+    return tgAPI('sendMessage', {
+      chat_id: chatId, message_thread_id: topicId, reply_to_message_id: message.reply_to_message.message_id,
+      text: `🔍 *籽青找到了 ${mediaRecords.length} 条收录记录喵～*\n\n${lines.join('\n\n')}`,
+      parse_mode: 'Markdown', disable_web_page_preview: true
+    }, env);
   }
 
   // 🌟 快捷回复管理魔法 (/d 和 /mv) — 单条回复模式

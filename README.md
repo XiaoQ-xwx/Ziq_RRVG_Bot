@@ -45,7 +45,7 @@
 - 在 Worker 的 `Variables and Secrets` 中添加以下环境变量：
   - `BOT_TOKEN_ENV`: 你的 Telegram Bot Token。
   - `ADMIN_SECRET`: (可选) 自定义密钥，用于外部 Python 脚本导入数据时的安全校验。
-- 复制项目内的worker.js的全部代码，在Cloudflare Worker的编辑代码内粘贴并左上角部署。
+- 复制项目内的worker.js的全部代码，在Cloudflare Worker的编辑代码内粘贴并右上角部署。
 ### 3. 一键初始化
 将代码部署至 Worker 后，在浏览器中直接访问你的 Worker 域名（如 `https://your-worker.your-subdomain.workers.dev/`）。页面提示"部署大成功"即代表 Webhook 与数据库已自动就绪。
 
